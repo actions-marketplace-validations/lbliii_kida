@@ -11,11 +11,13 @@ All functions are stateless and safe for concurrent use.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from time import perf_counter as _perf_counter
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 
 from kida.render_accumulator import RenderAccumulator
 from kida.render_accumulator import get_accumulator as _get_accumulator
+from kida.render_capture import get_capture as _get_capture
 from kida.utils.html import _SPACELESS_RE, Markup
 
 if TYPE_CHECKING:
@@ -124,8 +126,7 @@ def safe_getattr(obj: object, name: str) -> object:
     # type() is dict skips the isinstance MRO probe; dict subclasses fall
     # through to the isinstance branch which preserves subscript-first order.
     if type(obj) is dict:
-        d = cast("dict[str, Any]", obj)
-        val = d.get(name, _MISS)
+        val = dict.get(obj, name, _MISS)
         if val is not _MISS:
             return "" if val is None else val
         # Fallback to getattr for dict methods (items, keys, etc.)
@@ -154,19 +155,18 @@ def safe_getattr(obj: object, name: str) -> object:
 
 
 def getattr_preserve_none(obj: object, name: str) -> object:
-    """Get attribute with dict fallback, preserving None values.
+    """Get attribute with mapping fallback, preserving None values.
 
     Like safe_getattr but preserves None values instead of converting
     to empty string. Used for optional chaining (?.) so that null
     coalescing (??) can work correctly.
 
-    Resolution order matches safe_getattr: dicts try subscript first.
+    Resolution order matches safe_getattr: Mappings try subscript first.
 
     Complexity: O(1)
     """
     if type(obj) is dict:
-        d = cast("dict[str, Any]", obj)
-        val = d.get(name, _MISS)
+        val = dict.get(obj, name, _MISS)
         if val is not _MISS:
             return val
         # Fallback to getattr for dict methods (items, keys, etc.)
@@ -174,7 +174,7 @@ def getattr_preserve_none(obj: object, name: str) -> object:
         if val is not _MISS:
             return val
         return None
-    if isinstance(obj, dict):
+    if isinstance(obj, Mapping):
         try:
             return obj[name]  # ty: ignore[invalid-argument-type]
         except KeyError:
@@ -191,6 +191,24 @@ def getattr_preserve_none(obj: object, name: str) -> object:
         return None
 
 
+def getitem_preserve_none(obj: object, key: object) -> object:
+    """Optional subscript with Mapping fallback, preserving None values.
+
+    Used by `?[key]` in lenient mode. Mapping receivers return ``None`` for
+    missing keys (mirroring ``dict.get(key)``); other subscriptable receivers
+    return ``None`` on ``KeyError``/``IndexError``/``TypeError``.
+
+    Complexity: O(1)
+    """
+    if isinstance(obj, Mapping):
+        mapping = cast("Mapping[Any, Any]", obj)
+        return mapping.get(key)
+    try:
+        return cast("Any", obj)[key]
+    except KeyError, IndexError, TypeError:
+        return None
+
+
 # =============================================================================
 # Strict Attribute Access (opt-in via Environment(strict_undefined=True))
 # =============================================================================
@@ -198,7 +216,7 @@ def getattr_preserve_none(obj: object, name: str) -> object:
 # returning UNDEFINED/"". Used when the user wants to catch template typos.
 
 
-def _raise_undefined_attr(obj: object, name: str, *, preserve_none: bool = False) -> Any:
+def _raise_undefined_attr(obj: object, name: str, *, preserve_none: bool = False) -> Never:
     """Raise UndefinedError for missing attribute/key access."""
     from kida.exceptions import UndefinedError, build_source_snippet
     from kida.render_context import get_render_context
@@ -208,16 +226,31 @@ def _raise_undefined_attr(obj: object, name: str, *, preserve_none: bool = False
     lineno = render_ctx.line if render_ctx else None
     source = render_ctx.source if render_ctx else None
     snippet = build_source_snippet(source, lineno) if source and lineno else None
+    template_stack = list(render_ctx.template_stack) if render_ctx else []
+    component_stack = list(render_ctx.component_stack) if render_ctx else []
+    declared = render_ctx.declared_definitions if render_ctx else None
 
     obj_type = type(obj).__name__
     qual_name = name if obj is None else f"{obj_type}.{name}"
+    if isinstance(obj, Mapping):
+        available_names = frozenset(f"{obj_type}.{key}" for key in obj if isinstance(key, str))
+    elif obj is None:
+        available_names = frozenset()
+    else:
+        available_names = frozenset(
+            f"{obj_type}.{attr}" for attr in dir(obj) if not attr.startswith("_")
+        )
 
     raise UndefinedError(
         qual_name,
         template_name,
         lineno,
+        available_names=available_names,
         source_snippet=snippet,
+        template_stack=template_stack,
+        component_stack=component_stack,
         kind="attribute/key",
+        declared_definitions=declared,
     ) from None
 
 
@@ -230,8 +263,7 @@ def strict_getattr(obj: object, name: str) -> object:
     if obj is None:
         _raise_undefined_attr(obj, name)
     if type(obj) is dict:
-        d = cast("dict[str, Any]", obj)
-        val = d.get(name, _MISS)
+        val = dict.get(obj, name, _MISS)
         if val is not _MISS:
             return "" if val is None else val
         val = getattr(obj, name, _MISS)
@@ -260,24 +292,32 @@ def strict_getattr(obj: object, name: str) -> object:
 
 
 def strict_getattr_preserve_none(obj: object, name: str) -> object:
-    """Like getattr_preserve_none but raises UndefinedError on missing attributes."""
+    """Like getattr_preserve_none but raises UndefinedError on missing object attrs.
+
+    Semantics (v0.8.0+):
+
+    - Mapping receivers (``dict`` and ``collections.abc.Mapping`` subclasses):
+      missing keys short-circuit to ``None``, mirroring ``dict.get(key)``.
+      Used by ``?.`` on config/JSON/kwargs-style data where the schema is open.
+    - Object receivers (non-Mapping): missing attributes still raise
+      ``UndefinedError`` to catch template typos against an object's schema.
+    """
     if type(obj) is dict:
-        d = cast("dict[str, Any]", obj)
-        val = d.get(name, _MISS)
+        val = dict.get(obj, name, _MISS)
         if val is not _MISS:
             return val
         val = getattr(obj, name, _MISS)
         if val is not _MISS:
             return val
-        _raise_undefined_attr(obj, name, preserve_none=True)
-    if isinstance(obj, dict):
+        return None
+    if isinstance(obj, Mapping):
         try:
             return obj[name]  # ty: ignore[invalid-argument-type]
         except KeyError:
             try:
                 return getattr(obj, name)
             except AttributeError:
-                _raise_undefined_attr(obj, name, preserve_none=True)
+                return None
     val = getattr(obj, name, _MISS)
     if val is not _MISS:
         return val
@@ -285,6 +325,26 @@ def strict_getattr_preserve_none(obj: object, name: str) -> object:
         return obj[name]  # ty: ignore[not-subscriptable]
     except KeyError, TypeError:
         _raise_undefined_attr(obj, name, preserve_none=True)
+    return None  # unreachable, satisfies type checker
+
+
+def strict_getitem_preserve_none(obj: object, key: object) -> object:
+    """Like getitem_preserve_none but strict on non-Mapping subscript misses.
+
+    Semantics (v0.8.0+):
+
+    - Mapping receivers: missing keys short-circuit to ``None``.
+    - Sequence / other subscriptable receivers: out-of-range or invalid-key
+      access raises ``UndefinedError``. Off-by-one on a list is almost always
+      a bug, so strict mode preserves typo detection there.
+    """
+    if isinstance(obj, Mapping):
+        mapping = cast("Mapping[Any, Any]", obj)
+        return mapping.get(key)
+    try:
+        return cast("Any", obj)[key]
+    except KeyError, IndexError, TypeError:
+        _raise_undefined_attr(obj, str(key), preserve_none=True)
     return None  # unreachable, satisfies type checker
 
 
@@ -302,7 +362,7 @@ def strict_getattr_preserve_none(obj: object, name: str) -> object:
 _REGION_DEFAULT = object()
 
 
-def markup_concat(left: Any, right: Any) -> str:
+def markup_concat(left: object, right: object) -> str:
     """Concatenate for ~ operator, preserving Markup safety.
 
     If either operand is Markup, the result is Markup and the non-Markup
@@ -330,13 +390,14 @@ STATIC_NAMESPACE: dict[str, Any] = {
     "_int": int,
     "_float": float,
     "_get_accumulator": _get_accumulator,
+    "_get_capture": _get_capture,
     "_perf_counter": _perf_counter,
     "_UNDEFINED": UNDEFINED,
     "_markup_concat": markup_concat,
 }
 
 
-def record_filter_usage(acc: RenderAccumulator | None, name: str, result: Any) -> Any:
+def record_filter_usage[T](acc: RenderAccumulator | None, name: str, result: T) -> T:
     """Record filter usage for profiling, returning the result unchanged.
 
     Called by compiled code for every filter invocation. When profiling
@@ -355,7 +416,7 @@ def record_filter_usage(acc: RenderAccumulator | None, name: str, result: Any) -
     return result
 
 
-def record_macro_usage(acc: RenderAccumulator | None, name: str, result: Any) -> Any:
+def record_macro_usage[T](acc: RenderAccumulator | None, name: str, result: T) -> T:
     """Record macro ({% def %}) call for profiling, returning the result unchanged.
 
     Called by compiled code for every macro invocation. When profiling
@@ -406,6 +467,7 @@ def lookup(ctx: dict[str, Any], var_name: str) -> Any:
         snippet = build_source_snippet(source, lineno) if source and lineno else None
         template_stack = list(render_ctx.template_stack) if render_ctx else []
         component_stack = list(render_ctx.component_stack) if render_ctx else []
+        declared = render_ctx.declared_definitions if render_ctx else None
         raise UndefinedError(
             var_name,
             template_name,
@@ -414,6 +476,7 @@ def lookup(ctx: dict[str, Any], var_name: str) -> Any:
             source_snippet=snippet,
             template_stack=template_stack,
             component_stack=component_stack,
+            declared_definitions=declared,
         ) from None
 
 
@@ -451,6 +514,7 @@ def lookup_scope(ctx: dict[str, Any], scope_stack: list[dict[str, Any]], var_nam
     for scope in scope_stack:
         all_names.update(scope.keys())
 
+    declared = render_ctx.declared_definitions if render_ctx else None
     raise UndefinedError(
         var_name,
         template_name,
@@ -459,14 +523,15 @@ def lookup_scope(ctx: dict[str, Any], scope_stack: list[dict[str, Any]], var_nam
         source_snippet=snippet,
         template_stack=template_stack,
         component_stack=component_stack,
+        declared_definitions=declared,
     ) from None
 
 
 def default_safe(
-    value_fn: Callable[[], Any],
-    default_value: Any = "",
+    value_fn: Callable[[], object],
+    default_value: object = "",
     boolean: bool = False,
-) -> Any:
+) -> object:
     """Safe default filter that works with strict mode.
 
     In strict mode, the value expression might raise UndefinedError.
@@ -496,7 +561,7 @@ def default_safe(
         return value if (value is not None and not isinstance(value, _Undefined)) else default_value
 
 
-def is_defined(value_fn: Callable[[], Any]) -> bool:
+def is_defined(value_fn: Callable[[], object]) -> bool:
     """Check if a value is defined in strict mode.
 
     In strict mode, we need to catch UndefinedError to determine
@@ -526,7 +591,7 @@ def is_defined(value_fn: Callable[[], Any]) -> bool:
         return False
 
 
-def null_coalesce(left_fn: Callable[[], Any], right_fn: Callable[[], Any]) -> Any:
+def null_coalesce(left_fn: Callable[[], object], right_fn: Callable[[], object]) -> object:
     """Safe null coalescing that handles undefined variables.
 
     In strict mode, the left expression might raise UndefinedError.
@@ -602,7 +667,7 @@ def add_polymorphic(left: Any, right: Any) -> str:
     return left + right
 
 
-def coerce_numeric(value: Any) -> int | float:
+def coerce_numeric(value: object) -> int | float:
     """Coerce value to numeric type for arithmetic operations.
 
     Handles Markup objects (from macros) and strings that represent numbers.
@@ -679,7 +744,11 @@ def consume(key: str, default: Any = None) -> Any:
     return rc.consume(key, default)
 
 
-def optional_call(callee: Any, *args: object, **kwargs: object) -> Any:
+def optional_call(
+    callee: Callable[..., object] | _Undefined | None,
+    *args: object,
+    **kwargs: object,
+) -> object:
     """Call callee only if it is not None or UNDEFINED.
 
     Used for obj?.method() so that when obj is None or obj.attr is UNDEFINED,
@@ -687,4 +756,4 @@ def optional_call(callee: Any, *args: object, **kwargs: object) -> Any:
     """
     if callee is None or callee is UNDEFINED:
         return UNDEFINED
-    return callee(*args, **kwargs)
+    return cast("Callable[..., object]", callee)(*args, **kwargs)

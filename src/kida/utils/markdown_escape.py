@@ -4,12 +4,12 @@ Provides GFM-safe escaping and the Marked safe-string class for markdown mode.
 Analogous to terminal_escape.py's ansi_sanitize/Styled but for GitHub-flavored
 markdown output.
 
-Escapes special markdown characters via str.translate() with backslash prefixes.
 Objects implementing __markdown__() bypass escaping (like __terminal__/__html__).
 """
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Any, Self, SupportsIndex, cast
 
 if TYPE_CHECKING:
@@ -19,11 +19,18 @@ if TYPE_CHECKING:
 # Markdown Special Characters
 # =============================================================================
 
-# Characters that have special meaning in GFM and need backslash-escaping
-_MD_SPECIAL = '*_[]()#`+-!|~>\\"'
+# Inline-special characters that can trigger markdown formatting anywhere
+# in a line. Backslash is included so existing backslashes are preserved
+# rather than chained with following escapes.
+_INLINE_SPECIAL = "\\`*_[]<"
+_INLINE_TABLE = str.maketrans({ch: f"\\{ch}" for ch in _INLINE_SPECIAL})
 
-# Build a translation table: each special char -> backslash + char
-_ESCAPE_TABLE = str.maketrans({ch: f"\\{ch}" for ch in _MD_SPECIAL})
+# Block-leading patterns that only have meaning at the start of a line
+# (after up to 3 spaces of indentation, per CommonMark): ATX headings,
+# blockquotes, unordered list markers, and ordered list markers.
+_BLOCK_LEAD_RE = re.compile(
+    r"(^|\n)([ \t]{0,3})(#{1,6}(?=[ \t]|$)|>|[-+](?=[ \t]|$)|\d{1,9}[.)](?=[ \t]|$))"
+)
 
 
 # =============================================================================
@@ -32,25 +39,23 @@ _ESCAPE_TABLE = str.maketrans({ch: f"\\{ch}" for ch in _MD_SPECIAL})
 
 
 def markdown_escape(value: Any) -> str:
-    """Escape GFM special characters in untrusted input.
+    """Escape GFM-significant characters in untrusted input.
 
-    Checks the ``__markdown__`` protocol first — objects that implement it
-    are considered pre-escaped and returned as-is (like ``__html__`` for
-    Markup or ``__terminal__`` for Styled).
+    Inline characters (``\\``, `` ` ``, ``*``, ``_``, ``[``, ``]``, ``<``) are
+    always backslash-escaped. Block-leading markers (``#``, ``>``, ``-``,
+    ``+``, ordered-list digits) are escaped only at the start of a line —
+    matching how real GFM parsers interpret them and keeping inline content
+    like dates, version numbers, and prose hyphens unmangled.
 
-    Args:
-        value: Value to escape (will be converted to string).
-
-    Returns:
-        String with GFM special characters backslash-escaped.
+    Objects implementing the ``__markdown__`` protocol bypass escaping.
     """
-    # __markdown__ protocol: already-safe content
     markdown_method = getattr(value, "__markdown__", None)
     if markdown_method is not None:
         return str(markdown_method())
 
     s = value if isinstance(value, str) else str(value)
-    return s.translate(_ESCAPE_TABLE)
+    s = s.translate(_INLINE_TABLE)
+    return _BLOCK_LEAD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}\\{m.group(3)}", s)
 
 
 # =============================================================================
@@ -86,7 +91,7 @@ class Marked(str):
 
     # --- Operations that escape non-Marked values ---
 
-    def __add__(self, other: str) -> Self:  # type: ignore[override]
+    def __add__(self, other: str) -> Self:
         if isinstance(other, str) and not isinstance(other, Marked):
             other = markdown_escape(other)
         return self.__class__(super().__add__(other))
@@ -96,10 +101,10 @@ class Marked(str):
             other = markdown_escape(other)
         return self.__class__(other.__add__(self))
 
-    def __mul__(self, n: SupportsIndex) -> Self:  # type: ignore[override]
+    def __mul__(self, n: SupportsIndex) -> Self:
         return self.__class__(super().__mul__(n))
 
-    def __mod__(self, args: Any) -> Self:  # type: ignore[override]
+    def __mod__(self, args: Any) -> Self:
         escaped_args: Any
         if isinstance(args, tuple):
             args_tuple = cast("tuple[Any, ...]", args)
@@ -116,12 +121,12 @@ class Marked(str):
             return self
         return self.__class__(format(str(self), format_spec))
 
-    def format(self, *args: Any, **kwargs: Any) -> Self:  # type: ignore[override]
+    def format(self, *args: Any, **kwargs: Any) -> Self:
         args = tuple(_escape_arg(a) for a in args)
         kwargs = {k: _escape_arg(v) for k, v in kwargs.items()}
         return self.__class__(super().format(*args, **kwargs))
 
-    def join(self, seq: Iterable[str]) -> Self:  # type: ignore[override]
+    def join(self, seq: Iterable[str]) -> Self:
         return self.__class__(super().join(_escape_arg(s) for s in seq))
 
 

@@ -19,16 +19,27 @@ icon: alert-circle
 
 Debug `UndefinedError` exceptions.
 
+:::tip[Upgrading from 0.6.x?]
+`strict_undefined=True` became the default in 0.7.0. If you are hitting a wave of `UndefinedError` exceptions after an upgrade, see [[docs/tutorials/upgrade-to-v0.7|Upgrade to 0.7]] for the three fix patterns and the escape hatch.
+:::
+
 ## The Error
 
 ```
 UndefinedError: Undefined variable 'usre' in page.html:5
 ```
 
+Recent Kida diagnostics also carry structured fields for frameworks:
+
+- `to_diagnostic().location` — template name, line, and optional column
+- `to_diagnostic().source_snippet` — surrounding source lines
+- `to_diagnostic().hints` — ordered next actions
+- `to_diagnostic().template_stack` and `.component_stack` — render path context
+
 ## Common Causes
 
 :::{dropdown} Typo in variable name
-:icon: spell-check
+:icon: check-circle
 
 ```kida
 {# ❌ Typo #}
@@ -42,7 +53,7 @@ Check spelling against what's passed to `render()`.
 :::
 
 :::{dropdown} Variable not passed to template
-:icon: plug
+:icon: puzzle
 
 ```python
 # ❌ Missing variable
@@ -69,23 +80,45 @@ Ensure all template variables are passed in `render()`.
 Verify object attributes match your code.
 :::
 
-:::{dropdown} Nested object is None
+:::{dropdown} Imported component slot uses a missing caller value
 :icon: layers
 
 ```kida
-{# ❌ parent might be None #}
-{{ page.parent.title }}
+{% from "components/card.html" import card %}
 
-{# ✅ Check first #}
-{% if page.parent %}
-    {{ page.parent.title }}
+{% call card() %}
+  {{ missing_in_slot }}
 {% end %}
 ```
 
-Use conditional checks or `default` filter.
+Kida reports this against the caller template line that owns the slot body, not
+the imported component file. Use the component stack to see which component was
+rendering when the slot failed.
+:::
+
+:::{dropdown} Nested object is None or missing
+:icon: layers
+
+```kida
+{# ❌ page.parent might be None or missing #}
+{{ page.parent.title }}
+
+{# ✅ Guard with `is defined` (works for attribute chains) #}
+{% if page.parent is defined and page.parent %}
+    {{ page.parent.title }}
+{% end %}
+
+{# ✅ Or use the null-coalescing operator #}
+{{ page.parent.title ?? "" }}
+```
+
+Under strict mode (the default), `{% if page.parent %}` alone raises if `parent` is missing — use `is defined` or `??`.
 :::
 
 ## Solutions
+
+Hints are ordered by confidence. A close typo match appears first; optional
+value patterns such as `default(...)`, `??`, or null-safe access follow.
 
 ### Use default Filter
 
@@ -125,20 +158,20 @@ The `is defined` test works on attribute chains, not just top-level variables. I
 {% end %}
 ```
 
-#### Undefined Sentinel
+#### Undefined Sentinel (lenient mode only)
 
-Missing attribute access returns an `_Undefined` sentinel (not an empty string). The sentinel is:
+With `strict_undefined=False` (opt-in), missing attribute access returns an `_Undefined` sentinel. The sentinel is:
 
 - **Falsy** — `{% if pokemon.name %}` works as a guard
 - **Stringifies to `""`** — `{{ pokemon.name }}` renders nothing when undefined
 - **Iterable** — yields nothing, so `{% for x in missing_attr %}` produces no output
 
-The `is defined` and `is undefined` tests work correctly on attribute chains (e.g. `{% if pokemon.name is defined %}`), making intent explicit. See [[docs/reference/tests|Tests Reference]] for the full test list.
+Under the default **strict mode**, missing attributes raise `UndefinedError`. Use `is defined`, `??`, or `| default(...)` to opt specific sites into lenient behavior. See [[docs/reference/tests|Tests Reference]] for the full test list.
 
 ### Optional Chaining Pattern
 
 ```kida
-{% if post and post.author %}
+{% if post is defined and post.author is defined %}
     {{ post.author.name }}
 {% end %}
 ```
@@ -146,8 +179,59 @@ The `is defined` and `is undefined` tests work correctly on attribute chains (e.
 ### Safe Navigation
 
 ```kida
-{{ user | default({}) | attr("name") | default("Unknown") }}
+{{ user.name ?? "Unknown" }}
 ```
+
+## Prefer Null-Safe Operators
+
+Under `strict_undefined=True`, reaching for Python's `.get("k", "")` inside templates adds noise at every call site. Kida ships with first-class null-safe operators — prefer these:
+
+### Optional Chaining — `?.` and `?[...]` (Mapping-soft, object-strict)
+
+Since v0.8.0, `?.` and `?[...]` short-circuit to `None` when either:
+
+- The **receiver** is `None` or undefined, **or**
+- The receiver is a **Mapping** (`dict` or `Mapping` subclass) and the key is missing.
+
+Missing attributes on a non-Mapping **object** still raise under strict mode — that's the typo-detection value of `strict_undefined`:
+
+```kida
+{# Receiver-None — yields "" #}
+{{ config?.theme }}        {# config = None → "" #}
+
+{# Mapping miss — yields "" (dict.get() idiom) #}
+{{ config?.theme }}        {# config = {}   → "" #}
+
+{# Object attr miss — still raises, combine with ?? for safety #}
+{{ user?.nickname ?? "" }}  {# user = User() with no .nickname → "" #}
+
+{# Safe patterns #}
+{{ config?.theme ?? "dark" }}
+{{ settings?["theme"] ?? "light" }}
+```
+
+### `| get(key, default)` Filter — drop-in for `dict.get`
+
+```kida
+{# Handles None receiver, missing dict key, AND missing object attr uniformly #}
+{{ config | get("theme", "light") | upper }}
+```
+
+Use `| get` when the lookup must be safe across all receiver shapes in one expression.
+
+### Chaining
+
+```kida
+{# Deep access with a named fallback #}
+{{ user?.profile?.bio ?? "No bio yet" }}
+
+{# Null-safe filter pipeline #}
+{{ config ?| get("theme") ?? "light" }}
+```
+
+:::tip[Coming from Jinja2?]
+Jinja2 lacks these operators, so a common Jinja2 pattern is `{{ config.get("theme", "") | upper }}` (using `dict.get`). That still works in Kida, but `{{ config?.theme | upper }}` is the preferred Kida idiom.
+:::
 
 ## Debug Tips
 
@@ -181,20 +265,35 @@ def render_debug(template_name, **context):
     return env.render(template_name, **context)
 ```
 
-## Strict Undefined Mode
+## Strict Mode (Default)
 
-Enable `strict_undefined=True` on your Environment to catch attribute typos immediately instead of getting silent empty output:
+As of 0.7.0, `strict_undefined=True` is the default. Missing variables **and** missing attributes raise `UndefinedError` with a descriptive message distinguishing variable, attribute, and key lookups.
+
+```python
+env = Environment(loader=FileSystemLoader("templates/"))
+# strict_undefined=True by default
+```
+
+To guard optional access within a template, use one of:
+
+```kida
+{{ user.nickname ?? "Anonymous" }}              {# null-coalescing #}
+{{ user.nickname | default("Anonymous") }}       {# default filter #}
+{% if user.nickname is defined %}...{% end %}    {# explicit test #}
+```
+
+### Opt Out (Lenient Mode)
+
+If you are porting templates that rely on silent empty-string fallback for missing attributes:
 
 ```python
 env = Environment(
     loader=FileSystemLoader("templates/"),
-    strict_undefined=True,
+    strict_undefined=False,
 )
 ```
 
-With strict mode, `{{ user.typo }}` raises `UndefinedError` immediately with a descriptive message ("Undefined attribute 'typo'") instead of rendering as an empty string. Error messages distinguish between variable, attribute, and key lookups.
-
-This is recommended for development and CI. In production, you may prefer the lenient default to avoid breaking pages on missing data.
+In lenient mode, missing attributes return an `_Undefined` sentinel (see above). This is recommended only as a transitional shim — prefer fixing sites with the idioms above.
 
 ## Prevention
 

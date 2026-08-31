@@ -28,7 +28,7 @@ jobs:
         python-version: ["3.14t"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -36,7 +36,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -112,7 +112,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.14t'
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: coverage.xml
           fail_ci_if_error: false
@@ -122,7 +122,7 @@ jobs:
     name: Type Check (ty)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -130,7 +130,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -142,13 +142,13 @@ jobs:
 
       - name: Run ty
         run: |
-          uv run ty check src/kida
+          uv run ty check src/kida action_support
 
       - name: Run ty (report)
         if: always()
         run: |
           mkdir -p reports
-          uv run ty check src/kida --output-format junit > reports/ty.xml || true
+          uv run ty check src/kida action_support --output-format junit > reports/ty.xml || true
 
       - name: Render ty report
         if: always()
@@ -172,7 +172,7 @@ jobs:
     name: Lint (ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -180,7 +180,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -192,13 +192,13 @@ jobs:
 
       - name: Run ruff check
         run: |
-          uv run ruff check src/kida tests/ benchmarks/ scripts/
+          uv run ruff check .
 
       - name: Run ruff (report)
         if: always()
         run: |
           mkdir -p reports
-          uv run ruff check src/kida tests/ benchmarks/ scripts/ \
+          uv run ruff check . \
             --output-format json > reports/ruff.json || true
 
       - name: Render ruff report
@@ -219,14 +219,45 @@ jobs:
 
       - name: Run ruff format check
         run: |
-          uv run ruff format --check src/kida tests/ benchmarks/ scripts/
+          uv run ruff format --check .
+
+  release-collector:
+    name: Release Collector Integration
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14t"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Collect and render release data
+        uses: ./
+        with:
+          template: release-notes
+          data: auto
+          data-format: github-prs
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.sha }}
+          post-to: step-summary
+          token: ${{ github.token }}
+          python-version: skip
+          install: 'false'
+          kida-command: uv run kida
 
   # Thread safety tests
   thread-safety:
     name: Thread Safety
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -234,7 +265,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -251,12 +282,35 @@ jobs:
         run: |
           uv run pytest tests/test_kida_stress_test.py tests/test_lru_cache_concurrency.py tests/test_bytecode_cache_concurrency.py -v --tb=short --timeout=120
 
+      - name: Run seeded randomized thread stress
+        env:
+          CI: true
+          PYTHON_GIL: "0"
+          KIDA_STRESS_SEED: "0"
+          KIDA_STRESS_RUNS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '25' || '1' }}
+        run: |
+          uv run pytest tests/test_randomized_thread_stress.py -vv -s --tb=short --timeout=120
+
+      - name: Run free-threaded debug-runtime stress
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          CI: true
+          PYTHON_GIL: "0"
+          PYTHONDEVMODE: "1"
+          PYTHONFAULTHANDLER: "1"
+          PYTHONMALLOC: debug
+          KIDA_REQUIRE_DEBUG_RUNTIME: "1"
+          KIDA_STRESS_SEED: "0"
+          KIDA_STRESS_RUNS: "25"
+        run: |
+          uv run python -X dev -m pytest tests/test_randomized_thread_stress.py -vv -s --tb=short --timeout=120
+
   # Async tests
   async-tests:
     name: Async Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -264,7 +318,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -287,7 +341,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -295,7 +349,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -317,7 +371,7 @@ jobs:
     name: Benchmark Regression
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -325,7 +379,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -338,6 +392,7 @@ jobs:
       - name: Run benchmark regression check
         env:
           CI: true
+          BENCHMARK_SUITE: core
           PYTHON_GIL: "0"
         run: |
           export PATH="$PWD/.venv/bin:$PATH"
@@ -349,7 +404,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -357,7 +412,7 @@ jobs:
           python-version: "3.14t"
 
       - name: Cache uv dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
@@ -369,10 +424,13 @@ jobs:
 
       - name: Run benchmarks
         run: |
-          uv run pytest benchmarks/ --benchmark-only --benchmark-json=benchmark-results.json -q
+          uv run pytest benchmarks/ --benchmark-only --benchmark-json=benchmark-results.raw.json -q
+          jq 'del(.benchmarks[].stats.data)' benchmark-results.raw.json > benchmark-results.json
+          rm benchmark-results.raw.json
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.sha }}
           path: benchmark-results.json
+          retention-days: 14

@@ -417,18 +417,21 @@ Frameworks like [Chirp](https://github.com/lbliii/chirp) use `template_metadata(
 
 ---
 
-## Macros
+## Coming from Jinja2? (Macros)
 
-Kida also supports the `{% macro %}` syntax:
+Kida does **not** support `{% macro %}` / `{% endmacro %}`. Use `{% def %}` with unified `{% end %}`:
 
 ```kida
-{% macro input(name, value="", type="text") %}
+{# Kida — equivalent to Jinja2 {% macro %} #}
+{% def input(name, value="", type="text") %}
     <input type="{{ type }}" name="{{ name }}" value="{{ value }}">
-{% endmacro %}
+{% end %}
 
 {{ input("username") }}
 {{ input("password", type="password") }}
 ```
+
+Attempting `{% macro %}` raises `K-PAR-001: Unknown block keyword: macro`.
 
 ## Importing Functions
 
@@ -512,7 +515,7 @@ If you see `Cannot iterate over macro 'X'`, a macro is shadowing a context varia
 ## See Also
 
 - [[docs/usage/components|Components Guide]] — Patterns for building reusable UI components
-- [[docs/tutorials/component-comparison|Jinja2 vs Kida Components]] — Side-by-side comparison
+- [[docs/tutorials/component-comparison|Kida Components vs Jinja2 Macros]] — Side-by-side comparison
 - [[docs/syntax/inheritance|Inheritance]] — Extend base templates
 - [[docs/syntax/includes|Includes]] — Include partials
 - [[docs/extending/custom-filters|Custom Filters]] — Python-defined filters

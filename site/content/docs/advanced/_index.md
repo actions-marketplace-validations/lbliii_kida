@@ -61,7 +61,7 @@ Protect against XSS in JavaScript, CSS, and URL contexts.
 :::{/card}
 
 :::{card} Profiling
-:icon: activity
+:icon: cpu
 :link: /docs/advanced/profiling/
 :description: Opt-in render instrumentation with zero overhead when disabled
 Track block timings, macro calls, includes, and filter usage.
@@ -72,6 +72,13 @@ Track block timings, macro calls, includes, and filter usage.
 :link: /docs/advanced/block-caching/
 :description: Connect analysis results to runtime block caching
 Cache site-scoped blocks for 40-60% faster builds.
+:::{/card}
+
+:::{card} Render Capture and Manifests
+:icon: database
+:link: /docs/advanced/render-capture/
+:description: Record rendered block facts for build tooling
+Compare builds, inspect freeze-cache candidates, and derive search indexes.
 :::{/card}
 
 :::{card} Scoped Slots
@@ -96,7 +103,7 @@ Limit attribute access, function calls, and imports.
 :::{/card}
 
 :::{card} CSP Nonces
-:icon: shield-check
+:icon: shield
 :link: /docs/advanced/csp/
 :description: Content Security Policy nonce injection
 Auto-inject nonces into `<script>` and `<style>` tags.
@@ -110,7 +117,7 @@ Track which blocks, branches, and filters execute.
 :::{/card}
 
 :::{card} Type Checking
-:icon: type
+:icon: code
 :link: /docs/advanced/type-checking/
 :description: Static type analysis for template contexts
 Catch missing variables and type mismatches before rendering.
@@ -124,7 +131,7 @@ Detect missing alt text, form labels, and ARIA attributes.
 :::{/card}
 
 :::{card} Formatter
-:icon: align-left
+:icon: list
 :link: /docs/advanced/formatter/
 :description: Auto-format template source code
 Normalize indentation, whitespace, and tag style.

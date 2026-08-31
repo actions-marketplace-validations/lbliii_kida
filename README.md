@@ -3,299 +3,160 @@
 [![PyPI version](https://img.shields.io/pypi/v/kida-templates.svg)](https://pypi.org/project/kida-templates/)
 [![Build Status](https://github.com/lbliii/kida/actions/workflows/tests.yml/badge.svg)](https://github.com/lbliii/kida/actions/workflows/tests.yml)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14+-blue.svg)](https://pypi.org/project/kida-templates/)
+[![Python 3.14t no-GIL tested](https://img.shields.io/badge/Python%203.14t-no--GIL%20tested-2ea44f.svg)](https://lbliii.github.io/kida/docs/about/thread-safety/#tested-support-status)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**A Python component framework for HTML — typed props, named slots, scoped state, error boundaries, and zero JavaScript.**
+![Kida, a cross-eyed snow-lynx Bengal cat, actively assembling jungle components that become web, terminal, Markdown, and CI output](site/assets/images/kida-jungle-components-hero.webp)
 
-Kida compiles templates to Python AST, renders to HTML/terminal/markdown, and scales across cores on free-threaded Python 3.14t. Zero runtime dependencies.
+**Server-side components for Python—typed, composable, and checked before render.**
+
+Kida gives Python applications a real component model: typed props, named and
+scoped slots, static call-site validation, and error boundaries. The same pure-
+Python engine renders HTML, Markdown, terminal output, and CI reports—with no
+npm, no build step, and no runtime dependencies.
+
+[Read the docs](https://lbliii.github.io/kida/) ·
+[Build a component](https://lbliii.github.io/kida/docs/usage/components/) ·
+[Compare with Jinja2 macros](https://lbliii.github.io/kida/docs/tutorials/component-comparison/)
+
+## Why Kida
+
+Templates become application architecture long before most template engines
+notice. Arguments stay implicit, composition collapses into one caller block,
+and broken component calls surface only when a request renders the wrong path.
+
+Kida makes those contracts explicit:
+
+- **Typed props** document and validate a component's inputs.
+- **Named and scoped slots** compose structure without prop drilling.
+- **Static validation** catches bad names, missing props, and literal type
+  mismatches before render.
+- **Structured metadata** lets frameworks discover components without parsing
+  private AST internals.
+- **One rendering model** serves web pages, fragments, docs, terminals, and CI.
 
 ## Quick Start
+
+Kida requires Python 3.14 or later.
 
 ```bash
 pip install kida-templates
 ```
 
+Define a component and call it in the same template:
+
 ```kida
 {% def card(title: str, variant: str = "default") %}
 <article class="card card--{{ variant }}">
-  <h3>{{ title }}</h3>
-  <div class="actions">{% slot header_actions %}</div>
-  <div class="body">{% slot %}</div>
+  <header>
+    <h2>{{ title }}</h2>
+    {% slot actions %}
+  </header>
+  <div class="card__body">{% slot %}</div>
 </article>
-{% end %}
+{% enddef %}
 
 {% call card("Settings", variant="elevated") %}
-  {% slot header_actions %}<button>Save</button>{% end %}
+  {% slot actions %}<button>Save</button>{% end %}
   <p>Configure your preferences.</p>
-{% end %}
+{% endcall %}
 ```
+
+Render it from ordinary Python:
 
 ```python
 from kida import Environment, FileSystemLoader
 
 env = Environment(loader=FileSystemLoader("templates/"))
-template = env.get_template("page.html")
-html = template.render(title="Hello")
+html = env.get_template("page.html").render()
 ```
 
----
+Kida's canonical block ending is `{% end %}`. Matching explicit closers such as
+`{% endif %}`, `{% endfor %}`, and `{% endblock %}` are also accepted, so an
+otherwise compatible Jinja template does not need closer-only edits.
 
-## Component Model
+## Catch Broken Calls Before Render
 
-Kida gives you the composition patterns of modern frontend frameworks, without a build step.
+Suppose a call misspells `label` and passes a string where `count` expects an
+integer:
 
-| Feature | Syntax |
-|---------|--------|
+```kida
+{% def badge(count: int, label: str) %}
+<span class="badge">{{ count }} {{ label }}</span>
+{% enddef %}
+
+{{ badge(count="five", lable="Messages") }}
+```
+
+Run the checker:
+
+```bash
+kida check templates/ --strict --validate-calls
+```
+
+```text
+templates/dashboard.html:5: K-CMP-001: Call to 'badge' — unknown params: lable; missing required: label
+templates/dashboard.html:5: K-CMP-002: type: badge() param 'count' expects int, got str ('five')
+```
+
+The mistake stays in the editor or CI—not in a user's request.
+
+## A Component Model, Not a Macro Convention
+
+| Capability | Kida |
+|---|---|
 | Typed props | `{% def card(title: str, count: int = 0) %}` |
-| Named slots | `{% slot header %}` / `{% slot %}` (default) |
-| Conditional slots | `has_slot("footer")` |
-| Scoped slots (data up) | `{% slot row let:item=item %}` |
-| Slot forwarding | `{% yield name %}` |
-| Context propagation | `{% provide theme = "dark" %}` / `consume("theme")` |
-| Error boundaries | `{% try %}...{% fallback error %}...{% end %}` |
-| Co-located styles | `{% push "styles" %}` / `{% stack "styles" %}` |
-| Pattern matching | `{% match status %}{% case "active" %}...{% end %}` |
-| Block-scoped variables | `{% set %}` (scoped) / `{% let %}` (template-wide) / `{% export %}` |
-
-### Static Validation
-
-```bash
-kida check templates/ --validate-calls
-```
-
-```
-card.html:14: type: badge() param 'count' expects int, got str ("five")
-dashboard.html:8: Call to 'card' — unknown params: titl
-```
-
-Catches unknown params, missing required params, and literal type mismatches at check time.
-
-### Component Discovery
-
-```bash
-kida components templates/
-
-# components/card.html
-#   def card(title: str, subtitle: str | None = None)
-#     slots: header_actions, footer
-#
-# components/button.html
-#   def button(label: str, variant: str = "primary")
-#     slots: (none)
-#
-# 2 component(s) found.
-```
-
-### Introspection API
-
-```python
-template = env.get_template("components/card.html")
-meta = template.def_metadata()
-card = meta["card"]
-print(card.params)           # (DefParamInfo(name='title', annotation='str', ...), ...)
-print(card.slots)            # ('header_actions', 'footer')
-print(card.has_default_slot) # True
-```
-
----
-
-## Why Not Jinja2?
-
-| | Jinja2 | Kida |
-|---|---|---|
-| **Typed parameters** | No | `param: str \| None` |
-| **Named slots** | No (`caller()` only) | `{% slot name %}` |
-| **Scoped variables** | `set` leaks out of blocks | `set` is block-scoped |
-| **Context propagation** | Prop drilling | `provide` / `consume` |
-| **Error boundaries** | No | `{% try %}...{% fallback %}` |
-| **Component styles** | Disconnected CSS files | `{% push "styles" %}` |
-| **Call-site validation** | Runtime errors | Compile-time checks |
-| **Component discovery** | Read every file | `kida components` CLI |
-| **Block rendering** | No | `render_block()` for HTMX partials |
-| **Streaming** | Limited | `render_stream()` for chunked HTTP/SSE |
-| **Free-threading** | No | GIL-free on Python 3.14t |
-
----
-
-## Render Surfaces
-
-One template syntax, four outputs.
-
-<details>
-<summary><strong>HTML</strong></summary>
-
-```python
-from kida import Environment, FileSystemLoader
-
-env = Environment(loader=FileSystemLoader("templates/"))
-html = env.get_template("page.html").render(title="Hello")
-```
-
-</details>
-
-<details>
-<summary><strong>Terminal</strong></summary>
-
-```python
-from kida.terminal import terminal_env
-
-env = terminal_env()
-template = env.from_string("""
-{{ "Deploy Status" | bold | cyan }}
-{{ hr(40) }}
-{% for svc in services %}
-{{ svc.name | pad(20) }}{{ svc.status | badge }}
-{% end %}
-""")
-print(template.render(services=[
-    {"name": "api", "status": "pass"},
-    {"name": "worker", "status": "fail"},
-]))
-```
-
-</details>
-
-<details>
-<summary><strong>Markdown</strong></summary>
-
-```python
-from kida.markdown import markdown_env
-
-env = markdown_env()
-md = env.from_string("# {{ title }}\n\n{{ body }}").render(
-    title="Report", body="All tests passed."
-)
-```
-
-</details>
-
-<details>
-<summary><strong>CI Reports (GitHub Action)</strong></summary>
-
-Turn pytest, coverage, ruff, and other tool output into step summaries and PR comments.
-
-```yaml
-- uses: lbliii/kida@v0.3.3
-  with:
-    template: pytest
-    data: results.xml
-    data-format: junit-xml
-    post-to: step-summary,pr-comment
-```
-
-Built-in templates for pytest, coverage, ruff, ty, jest, gotest, and sarif. [Full action docs &rarr;](https://lbliii.github.io/kida/docs/usage/github-action/)
-
-</details>
-
----
-
-## More Features
-
-<details>
-<summary><strong>Template Inheritance</strong></summary>
-
-```kida
-{# base.html #}
-<!DOCTYPE html>
-<html>
-<body>{% block content %}{% end %}</body>
-</html>
-
-{# page.html #}
-{% extends "base.html" %}
-{% block content %}<h1>{{ title }}</h1>{% end %}
-```
-
-</details>
-
-<details>
-<summary><strong>Regions (Parameterized Blocks)</strong></summary>
-
-```kida
-{% region sidebar(current_path="/") %}
-  <nav>{{ current_path }}</nav>
-{% end %}
-
-{{ sidebar(current_path="/about") }}
-```
-
-Regions are blocks (for `render_block()`) and callables (for inline use). Ideal for HTMX OOB swaps.
-
-</details>
-
-<details>
-<summary><strong>Pattern Matching & Null Safety</strong></summary>
-
-```kida
-{% match status %}
-{% case "active" %}Active{% case "pending" %}Pending{% case _ %}Unknown
-{% end %}
-
-{{ user.nickname ?? user.name ?? "Anonymous" }}
-{{ config?.database?.host }}
-{{ data ?|> parse ?|> validate ?|> render }}
-```
-
-</details>
-
-<details>
-<summary><strong>Streaming & Block Rendering</strong></summary>
-
-```python
-# Stream chunks as they render
-for chunk in template.render_stream(items=large_list):
-    response.write(chunk)
-
-# Render a single block (HTMX partials)
-html = template.render_block("content", title="Hello")
-
-# Compose layouts with pre-rendered blocks
-html = layout.render_with_blocks({"content": inner_html}, title="Page")
-```
-
-</details>
-
-<details>
-<summary><strong>Compile-Time Optimization</strong></summary>
-
-```python
-template = env.from_string(source, static_context={
-    "site": site_config, "settings": app_settings,
-})
-html = template.render(page_title="Home", items=page_items)
-```
-
-67 pure filters evaluated at compile time. Dead branches removed. Component inlining for small defs with constant args. Use `kida render template.html --explain` to see active optimizations.
-
-</details>
-
-<details>
-<summary><strong>Free-Threading</strong></summary>
-
-All public APIs are safe under `PYTHON_GIL=0` (Python 3.14t, PEP 703). Templates compile to immutable AST, rendering uses thread-local accumulators, and the Environment uses copy-on-write. Scales linearly with cores.
-
-</details>
-
-<details>
-<summary><strong>Framework Integration</strong></summary>
-
-```python
-# Flask
-from kida.contrib.flask import KidaFlask
-kida = KidaFlask(app)
-
-# Starlette / FastAPI
-from kida.contrib.starlette import KidaStarlette
-templates = KidaStarlette(directory="templates")
-
-# Django
-TEMPLATES = [{"BACKEND": "kida.contrib.django.KidaDjango", ...}]
-```
-
-</details>
-
-<details>
-<summary><strong>CLI</strong></summary>
+| Named slots | `{% slot actions %}` and `{% slot %}` |
+| Scoped slots | `{% slot row let:item=item %}` |
+| Conditional content | `has_slot("footer")` |
+| Context propagation | `{% provide theme = "dark" %}` and `consume("theme")` |
+| Error boundaries | `{% try %}...{% fallback error %}...{% endtry %}` |
+| Co-located assets | `{% push "styles" %}` and `{% stack "styles" %}` |
+| Partial rendering | `render_block()` and parameterized regions |
+| Streaming | `render_stream()` and `render_stream_async()` |
+| Discovery | `kida components templates/` or the introspection API |
+
+Use Kida in Flask, Django, FastAPI, Starlette, Chirp, Bengal, scripts, and CI.
+Render full pages or HTMX fragments; reuse the same semantics for Markdown
+reports and ANSI-aware terminal interfaces.
+
+The [app-owned component authoring contract](site/content/docs/usage/components.md#app-owned-authoring-contract)
+defines extraction heuristics, composition seams, and framework/application
+ownership boundaries.
+
+## One System, Many Surfaces
+
+| Surface | What Kida provides |
+|---|---|
+| Web applications | Components, layouts, streaming, and block rendering |
+| Static sites | Reusable content components and scoped state |
+| Terminal tools | ANSI-aware tables, badges, panels, and dashboards |
+| CI reports | GitHub step summaries and PR comments from test and analysis data |
+| Frameworks | Component metadata, dependency analysis, and multi-root inspection |
+
+The GitHub Action includes templates for pytest, coverage, ruff, ty, Jest, Go
+test, SARIF, release notes, and agent reports. See the
+[CI reporting guide](https://lbliii.github.io/kida/docs/usage/github-action/).
+
+## Pure Python, Including Free-Threading
+
+Kida has zero runtime dependencies. Templates compile to immutable Python code,
+render state lives in `ContextVar`, and environment mutation uses copy-on-write
+patterns. The documented sharing contract is tested under `PYTHON_GIL=0` on
+free-threaded Python 3.14t.
+
+That claim is intentionally bounded: it covers Kida's
+[public thread-safety contract](https://lbliii.github.io/kida/docs/about/thread-safety/#whats-safe),
+not unsynchronized application state or custom callables.
+
+## Explore
+
+- [Get started](https://lbliii.github.io/kida/docs/get-started/)
+- [Build components](https://lbliii.github.io/kida/docs/usage/components/)
+- [Integrate a framework](https://lbliii.github.io/kida/docs/tutorials/)
+- [Browse the syntax reference](https://lbliii.github.io/kida/docs/syntax/)
+- [Use the CLI](https://lbliii.github.io/kida/docs/reference/cli/)
+- [Read the security model](https://lbliii.github.io/kida/docs/advanced/security/)
 
 ```bash
 kida render template.txt --data context.json
@@ -305,27 +166,34 @@ kida fmt templates/
 kida extract templates/ -o messages.pot
 ```
 
-</details>
+## Status
 
----
+Kida is pre-1.0 and used standalone, through mainstream Python frameworks, and
+across a broader pure-Python rendering stack. The API can still move, but the
+core commitments are stable: typed composition, static validation, render-
+surface parity, zero runtime dependencies, and free-threaded safety.
 
-## The Bengal Ecosystem
+For migrations, start with the
+[0.12.0 release notes](https://lbliii.github.io/kida/releases/0.12.0/) and follow
+the linked upgrade guides.
 
-Kida is part of a pure-Python stack built for 3.14t free-threading.
+## Python Components Ecosystem
 
-| | | | |
-|--:|---|---|---|
-| **ᓚᘏᗢ** | [Bengal](https://github.com/lbliii/bengal) | Static site generator | [Docs](https://lbliii.github.io/bengal/) |
-| **∿∿** | [Purr](https://github.com/lbliii/purr) | Content runtime | — |
-| **⌁⌁** | [Chirp](https://github.com/lbliii/chirp) | Web framework | [Docs](https://lbliii.github.io/chirp/) |
-| **=^..^=** | [Pounce](https://github.com/lbliii/pounce) | ASGI server | [Docs](https://lbliii.github.io/pounce/) |
-| **)彡** | **Kida** | Component framework | [Docs](https://lbliii.github.io/kida/) |
-| **ฅᨐฅ** | [Patitas](https://github.com/lbliii/patitas) | Markdown parser | [Docs](https://lbliii.github.io/patitas/) |
-| **⌾⌾⌾** | [Rosettes](https://github.com/lbliii/rosettes) | Syntax highlighter | [Docs](https://lbliii.github.io/rosettes/) |
-| **ᓃ‿ᓃ** | [Milo](https://github.com/lbliii/milo-cli) | Terminal UI framework | [Docs](https://lbliii.github.io/milo-cli/) |
+Kida is the component layer in a personal, pure-Python stack built for Python
+3.14t. Each project stands on its own; together they cover the path from content
+and components to applications, servers, sites, terminals, and developer tools.
 
----
+| | Project | Role |
+|--:|---|---|
+| **⌁⌁** | [Chirp](https://github.com/lbliii/chirp) | Web framework |
+| **=^..^=** | [Pounce](https://github.com/lbliii/pounce) | ASGI server |
+| **)彡** | **Kida** | Server-side component system ← You are here |
+| **∿∿** | [Purr](https://github.com/lbliii/purr) | Content runtime |
+| **ᓚᘏᗢ** | [Bengal](https://github.com/lbliii/bengal) | Static-site integration |
+| **ฅᨐฅ** | [Patitas](https://github.com/lbliii/patitas) | Markdown parser |
+| **⌾⌾⌾** | [Rosettes](https://github.com/lbliii/rosettes) | Syntax highlighter |
+| **ᓃ‿ᓃ** | [Milo](https://github.com/lbliii/milo-cli) | Terminal UI framework |
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE).

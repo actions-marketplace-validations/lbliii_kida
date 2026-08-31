@@ -1,6 +1,6 @@
 ---
 title: Usage
-description: Loading templates, rendering HTML, streaming output, integrating Kida into Python applications, and rendering AI agent output
+description: Build typed components, render them across surfaces, and integrate Kida into Python applications
 draft: false
 weight: 30
 lang: en
@@ -9,7 +9,9 @@ tags:
 - usage
 keywords:
 - usage
-- loading
+- components
+- typed props
+- named slots
 - rendering
 - contexts
 - streaming templates
@@ -22,11 +24,23 @@ icon: terminal
 
 # Usage
 
-Practical patterns for using Kida in your applications.
+Practical patterns for building and rendering Kida components in your applications.
 
 :::{cards}
 :columns: 2
 :gap: medium
+
+:::{card} Components
+:icon: layers
+:link: /docs/usage/components/
+:description: Typed props, named slots, scoped state, and validation
+:::{/card}
+
+:::{card} Framework Integration
+:icon: puzzle
+:link: /docs/usage/framework-integration/
+:description: Bring Kida components to Python frameworks and static sites
+:::{/card}
 
 :::{card} Loading Templates
 :icon: folder
@@ -46,12 +60,6 @@ Practical patterns for using Kida in your applications.
 :description: Chunked rendering, async streaming, framework integration
 :::{/card}
 
-:::{card} Framework Integration
-:icon: puzzle
-:link: /docs/usage/framework-integration/
-:description: Block rendering, introspection, composition — for Chirp, Bengal, custom adapters
-:::{/card}
-
 :::{card} Escaping
 :icon: shield
 :link: /docs/usage/escaping/
@@ -59,19 +67,19 @@ Practical patterns for using Kida in your applications.
 :::{/card}
 
 :::{card} Error Handling
-:icon: alert-triangle
+:icon: warning
 :link: /docs/usage/error-handling/
 :description: Template errors, debugging, stack traces
 :::{/card}
 
 :::{card} Agent Message Protocol (AMP)
-:icon: radio
+:icon: network
 :link: /docs/usage/amp/
 :description: Structured AI agent output for multi-surface rendering
 :::{/card}
 
 :::{card} Agent Templates
-:icon: layout
+:icon: sidebar
 :link: /docs/usage/agent-templates/
 :description: Built-in templates for code review, PR summary, deploy preview, and more
 :::{/card}

@@ -4,7 +4,7 @@
 PYTHON_VERSION ?= 3.14t
 VENV_DIR ?= .venv
 
-.PHONY: all help setup install test test-cov test-thread test-async lint lint-fix format ty clean shell docs docs-serve build publish release gh-release action-tag
+.PHONY: all help setup install test test-cov test-thread test-async test-safety test-rc-safety lint lint-fix format format-check ty package-smoke verify-stability verify-rc clean shell docs docs-serve build publish release gh-release action-tag
 
 all: help
 
@@ -20,10 +20,15 @@ help:
 	@echo "  make test-cov   - Run tests with coverage report"
 	@echo "  make test-thread - Run thread safety stress tests"
 	@echo "  make test-async - Run async feature tests"
+	@echo "  make test-safety - Run focused safety/concurrency tests"
 	@echo "  make lint       - Run ruff linter"
 	@echo "  make lint-fix   - Run ruff linter with auto-fix"
 	@echo "  make format     - Run ruff formatter"
+	@echo "  make format-check - Check ruff formatting"
 	@echo "  make ty         - Run ty type checker (fast, Rust-based)"
+	@echo "  make package-smoke - Build artifacts and smoke-test installed wheel"
+	@echo "  make verify-stability - Run the full local stability gate"
+	@echo "  make verify-rc  - Alias for verify-stability"
 	@echo "  make docs       - Build documentation site (requires bengal)"
 	@echo "  make docs-serve - Start dev server for docs (requires bengal)"
 	@echo "  make build      - Build distribution packages"
@@ -47,44 +52,73 @@ install:
 	@bash -c 'source "$(VENV_DIR)/bin/activate" && uv sync --active --group dev --frozen'
 
 test:
-	uv run pytest -q --tb=short
+	uv run python -m pytest -q --tb=short
 
 test-cov:
-	uv run pytest --cov=src/kida --cov-report=term-missing
+	uv run python -m pytest --cov=kida --cov-report=term-missing --cov-fail-under=83
 
 test-thread:
 	@echo "Running thread safety stress tests..."
-	PYTHON_GIL=0 uv run pytest tests/test_kida_stress_test.py -v --tb=short
+	PYTHON_GIL=0 uv run python -m pytest \
+		tests/test_kida_stress_test.py \
+		tests/test_randomized_thread_stress.py \
+		-v --tb=short
 
 test-async:
 	@echo "Running async feature tests..."
-	PYTHON_GIL=0 uv run pytest tests/test_kida_async_features.py -v --tb=short
+	PYTHON_GIL=0 uv run python -m pytest tests/test_kida_async_features.py -v --tb=short
+
+test-safety:
+	@echo "Running focused safety/concurrency tests..."
+	PYTHON_GIL=0 uv run python -m pytest \
+		tests/test_render_surface_parity.py \
+		tests/test_sandbox_fuzz.py \
+		tests/test_bytecode_cache_concurrency.py \
+		tests/test_lru_cache_concurrency.py \
+		tests/test_kida_stress_test.py \
+		tests/test_randomized_thread_stress.py \
+		-q --tb=short
+
+test-rc-safety: test-safety
 
 lint:
 	@echo "Running ruff linter..."
-	uv run ruff check src/ tests/
+	uv run ruff check .
 
 lint-fix:
 	@echo "Running ruff linter with auto-fix..."
-	uv run ruff check src/ tests/ --fix
+	uv run ruff check . --fix
 
 format:
 	@echo "Running ruff formatter..."
-	uv run ruff format src/ tests/
+	uv run ruff format .
+
+format-check:
+	@echo "Checking ruff formatting..."
+	uv run ruff format --check .
 
 ty:
 	@echo "Running ty type checker (Astral, Rust-based)..."
-	uv run ty check src/kida/
+	uv run ty check src/kida/ action_support/
+
+package-smoke:
+	@echo "Building and smoke-testing package artifacts..."
+	uv run python scripts/package_smoke.py
+
+verify-stability: lint format-check ty test-cov test-safety package-smoke
+	@echo "✓ Stability verification gate passed"
+
+verify-rc: verify-stability
 
 docs:
 	@echo "Building documentation site..."
 	uv sync --group docs
-	cd site && uv run bengal site build
+	cd site && uv run bengal build
 
 docs-serve:
 	@echo "Starting documentation dev server..."
 	uv sync --group docs
-	cd site && uv run bengal site serve
+	cd site && uv run bengal serve
 
 # =============================================================================
 # Build & Release
@@ -114,15 +148,34 @@ release: build publish
 gh-release:
 	@VERSION=$$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/'); \
 	PROJECT=$$(grep -m1 '^name = ' pyproject.toml | sed 's/name = "\(.*\)"/\1/'); \
+	TAG="v$$VERSION"; \
 	NOTES="site/content/releases/$$VERSION.md"; \
+	if [ -n "$$(git status --porcelain)" ]; then echo "Error: working tree is not clean."; exit 1; fi; \
 	if [ ! -f "$$NOTES" ]; then echo "Error: $$NOTES not found"; exit 1; fi; \
-	echo "Creating release v$$VERSION for $$PROJECT..."; \
-	git push origin main 2>/dev/null || true; \
-	git push origin v$$VERSION 2>/dev/null || true; \
-	awk '/^---$$/{c++;next}c>=2' "$$NOTES" | gh release create v$$VERSION \
+	if gh release view "$$TAG" >/dev/null 2>&1; then echo "Error: release $$TAG already exists"; exit 1; fi; \
+	git fetch origin main --tags; \
+	LOCAL=$$(git rev-parse HEAD); \
+	REMOTE=$$(git rev-parse origin/main); \
+	if [ "$$LOCAL" != "$$REMOTE" ]; then \
+		echo "Error: HEAD must match origin/main before releasing."; \
+		echo "HEAD=$$LOCAL"; \
+		echo "origin/main=$$REMOTE"; \
+		exit 1; \
+	fi; \
+	REMOTE_TAG=$$(git ls-remote origin "refs/tags/$$TAG" | awk '{print $$1}'); \
+	if [ -n "$$REMOTE_TAG" ] && [ "$$REMOTE_TAG" != "$$LOCAL" ]; then \
+		echo "Error: remote $$TAG points at $$REMOTE_TAG, not $$LOCAL"; \
+		exit 1; \
+	fi; \
+	git tag -f "$$TAG" HEAD; \
+	if [ -z "$$REMOTE_TAG" ]; then git push origin "$$TAG"; fi; \
+	echo "Creating release $$TAG for $$PROJECT..."; \
+	awk '/^---$$/{c++;next}c>=2' "$$NOTES" | gh release create "$$TAG" \
+		--verify-tag \
+		--target main \
 		--title "$$PROJECT $$VERSION" \
 		-F -; \
-	echo "✓ GitHub release v$$VERSION created (PyPI publish will run via workflow)"; \
+	echo "✓ GitHub release $$TAG created (PyPI publish will run via workflow)"; \
 	$(MAKE) action-tag
 
 # Move the floating major action tag so `uses: lbliii/kida@v0` tracks the latest release.

@@ -1,6 +1,6 @@
 ---
-title: "Jinja2 vs Kida: Components"
-description: A real-world dashboard card built in Jinja2 and Kida — side by side
+title: "Kida Components vs Jinja2 Macros"
+description: Compare typed props, named slots, scoped state, and static validation with Jinja2 macro composition
 draft: false
 weight: 15
 lang: en
@@ -20,9 +20,12 @@ keywords:
 icon: columns
 ---
 
-# Jinja2 vs Kida: Components
+# Kida Components vs Jinja2 Macros
 
-A real-world dashboard card component built in both engines. Same HTML output, very different authoring experience.
+A Jinja2 macro can reuse markup. A Kida component adds an explicit contract:
+typed props, named slots, scoped state, and call-site validation before render.
+This real-world dashboard card produces the same HTML in both systems while
+showing the difference between reuse and a statically validated component model.
 
 The component has:
 - Typed props (title, subtitle, variant)
@@ -82,16 +85,17 @@ The component has:
 
 ### Scoping Trap
 
-Jinja2's `{% set %}` leaks out of blocks. This causes subtle bugs:
+Jinja2's `{% set %}` leaks through `if` branches but remains local to `for`
+loops. Code that expects a loop assignment to accumulate therefore stays at its
+outer value:
 
 ```jinja2
-{# Jinja2 — count leaks across iterations #}
+{# Jinja2 — the loop assignment remains local #}
 {% set count = 0 %}
 {% for section in sections %}
   {% set count = count + 1 %}
-  {# count is now modified in the OUTER scope #}
 {% endfor %}
-{# count == len(sections), not 0 — the set leaked #}
+{# count == 0 #}
 ```
 
 To work around this, Jinja2 requires the `namespace()` pattern:
@@ -330,7 +334,7 @@ Jinja2 has no equivalent — parameter errors surface at runtime.
 | Named slots | No | `{% slot name %}` |
 | Conditional slot rendering | No | `has_slot("name")` |
 | Scoped slot data (data up) | No | `let:item=expr` |
-| Block-scoped variables | No (`set` leaks) | `{% set %}` is block-scoped |
+| Block-scoped variables | `set` is local in loops, but not `if` branches | `{% set %}` is block-scoped |
 | Explicit outer-scope mutation | `namespace()` hack | `{% export %}` |
 | Context propagation | Prop drilling only | `{% provide %}` / `consume()` |
 | Error boundaries | No | `{% try %}...{% fallback %}` |

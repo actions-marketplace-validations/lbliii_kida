@@ -37,42 +37,36 @@ Templates with `{% extends %}` generate:
 from __future__ import annotations
 
 import ast
-import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from kida.compiler.coalescing import FStringCoalescingMixin
 from kida.compiler.expressions import ExpressionCompilationMixin
 from kida.compiler.statements import StatementCompilationMixin
-from kida.compiler.utils import OperatorUtilsMixin
+from kida.compiler.utils import (
+    LINE_TRACKED_NODE_TYPES,
+    fix_missing_locations_fast,
+    make_line_marker,
+    make_template_warning,
+)
 from kida.nodes import (
-    AsyncFor,
     Block,
     CallBlock,
-    Capture,
     Def,
-    Export,
     Extends,
-    For,
     FromImport,
-    If,
     Import,
     Let,
-    ListComp,
-    Match,
-    Name,
     Region,
-    Set,
-    While,
 )
-from kida.nodes.structure import With, WithConditional
-
-_BLOCK_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 if TYPE_CHECKING:
     import types
 
+    from kida.compiler.stream_transform import BlockFunctionVariants
     from kida.environment import Environment
+    from kida.exceptions import ErrorCode, TemplateWarning
     from kida.nodes import Node
     from kida.nodes import Template as TemplateNode
 
@@ -82,7 +76,6 @@ _TOP_LEVEL_STATEMENTS = frozenset(
 
 
 class Compiler(
-    OperatorUtilsMixin,
     ExpressionCompilationMixin,
     StatementCompilationMixin,
     FStringCoalescingMixin,
@@ -147,18 +140,22 @@ class Compiler(
         "_blocks",
         "_cached_pure_filters",
         "_ctx_override",
+        "_declared_definitions",
         "_def_caller_stack",
         "_def_names",
         "_env",
         "_extension_compilers",
         "_filename",
         "_has_async",
+        "_last_block_cacheable_vars",
         "_last_block_compiled_stmts",
         "_locals",
+        "_loop_usage_cache",
         "_loop_vars",
         "_name",
         "_node_dispatch",
         "_outer_caller_expr",
+        "_sandboxed",
         "_scope_override",
         "_streaming",
     )
@@ -224,11 +221,15 @@ class Compiler(
 
     def __init__(self, env: Environment):
         self._env = env
+        from kida.sandbox import SandboxedEnvironment
+
+        self._sandboxed = isinstance(env, SandboxedEnvironment)
         self._cached_pure_filters: frozenset[str] | None = None
+        self._last_block_cacheable_vars: set[str] = set()
         self._last_block_compiled_stmts: list[ast.stmt] | None = None
         self._name: str | None = None
         self._filename: str | None = None
-        self._warnings: list = []  # TemplateWarning instances
+        self._warnings: list[TemplateWarning] = []
         self._scope_depth: int = 0  # Track nesting depth inside scoping blocks (if/for/while)
         # Track local variables (loop variables, etc.) for O(1) direct access
         self._locals: set[str] = set()
@@ -244,8 +245,16 @@ class Compiler(
         self._async_mode: bool = False
         # Track {% def %} names for profiling instrumentation
         self._def_names: set[str] = set()
+        # Top-level {% def %} / {% region %} names — populated by
+        # _check_definition_nesting so the runtime can swap UndefinedError
+        # hints from "use .get()" to "did you declare {% region %} at the
+        # top level?" when a missing ctx name matches a declared definition.
+        self._declared_definitions: set[str] = set()
         # Track loop variables for include scope propagation
         self._loop_vars: set[str] = set()
+        # Per-compile memo for loop-variable analysis. The same AST bodies are
+        # consulted for sync, stream, and async function generation.
+        self._loop_usage_cache: dict[int, bool] = {}
         # Lexical caller scoping: def → call → caller() (reset in compile())
         self._def_caller_stack: list[ast.expr] = []
         self._outer_caller_expr: ast.expr | None = None
@@ -272,20 +281,23 @@ class Compiler(
         self._node_dispatch: dict[str, Callable] = type(self)._ensure_dispatch()
 
     @property
-    def warnings(self) -> list:
+    def warnings(self) -> list[TemplateWarning]:
         """Compile-time warnings accumulated during compilation."""
         return self._warnings
 
     def _emit_warning(
-        self, code, message: str, *, lineno: int | None = None, suggestion: str | None = None
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        lineno: int | None = None,
+        suggestion: str | None = None,
     ) -> None:
         """Record a compile-time warning."""
-        from kida.exceptions import TemplateWarning
-
         self._warnings.append(
-            TemplateWarning(
-                code=code,
-                message=message,
+            make_template_warning(
+                code,
+                message,
                 template_name=self._name,
                 lineno=lineno,
                 suggestion=suggestion,
@@ -303,126 +315,135 @@ class Compiler(
                 return None
         return None
 
-    def _collect_blocks(self, nodes: Sequence[Node]) -> None:
-        """Recursively collect all Block nodes from the AST.
+    # Control-flow / rendering-wrapper containers whose bodies do not
+    # reliably execute at module-init time. Defining {% def %} or
+    # {% region %} inside them means _globals_setup cannot bind the name
+    # for render_block() dispatch.
+    _SCOPED_PARENTS: ClassVar[dict[str, str]] = {
+        "If": "if",
+        "For": "for",
+        "AsyncFor": "for",
+        "While": "while",
+        "With": "with",
+        "WithConditional": "with",
+        "Provide": "provide",
+        "Try": "try",
+        "Match": "match",
+        "Cache": "cache",
+        "Capture": "capture",
+        "Push": "push",
+        "Spaceless": "spaceless",
+        "FilterBlock": "filter",
+    }
 
-        This ensures nested blocks (blocks inside blocks, blocks inside
-        conditionals, etc.) are all registered for compilation.
+    def _check_definition_nesting(
+        self,
+        nodes: Sequence[Node],
+        parent_chain: tuple[str, ...],
+    ) -> None:
+        """Recursively walk the AST and reject {% def %} / {% region %}
+        nested inside any control-flow construct.
+
+        ``parent_chain`` carries the human-readable tag names of enclosing
+        scoped parents (e.g. ``("for", "if")``). When a ``Def`` or ``Region``
+        is reached and the chain is non-empty, raises ``TemplateSyntaxError``
+        with code ``K-TPL-004``.
+
+        Other container nodes (Block, CallBlock, Embed, Def, Region, ...)
+        are traversed but do not contribute to the chain — defining nested
+        helpers inside them is a supported pattern.
         """
         from kida.exceptions import ErrorCode, TemplateSyntaxError
-        from kida.nodes import Block, CallBlock, Def, Region, Slot, SlotBlock
+        from kida.nodes import (
+            Embed,
+            Region,
+            SlotBlock,
+        )
 
         for node in nodes:
-            if isinstance(node, Block):
-                if not _BLOCK_NAME_RE.match(node.name):
+            type_name = type(node).__name__
+
+            if isinstance(node, (Def, Region)):
+                if parent_chain:
+                    kind = "region" if isinstance(node, Region) else "def"
+                    parent = parent_chain[-1]
                     err = TemplateSyntaxError(
-                        f"Invalid block name '{node.name}': must be identifier-like "
-                        "(e.g. [a-zA-Z_][a-zA-Z0-9_]*)",
+                        f"{{% {kind} {node.name} %}} must be declared at the top level "
+                        f"of the template, not nested inside {{% {parent} %}}. "
+                        f"Move {{% {kind} {node.name} %}} out of the enclosing "
+                        f"{{% {parent} %}} block — render_block() dispatch and "
+                        "_globals_setup only see top-level definitions.",
                         lineno=node.lineno,
                         name=self._name,
                         filename=self._filename,
                     )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
+                    err.code = ErrorCode.DEFINITION_NOT_TOPLEVEL
                     raise err
-                if node.name in self._blocks and isinstance(self._blocks[node.name], Region):
-                    err = TemplateSyntaxError(
-                        f"Duplicate block/region name '{node.name}'",
-                        lineno=node.lineno,
-                        name=self._name,
-                        filename=self._filename,
-                    )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
-                    raise err
-                self._blocks[node.name] = node
-                # Recurse into block body to find nested blocks
-                self._collect_blocks(node.body)
-            elif isinstance(node, Def):
-                if not _BLOCK_NAME_RE.match(node.name):
-                    err = TemplateSyntaxError(
-                        f"Invalid def name '{node.name}': must be identifier-like "
-                        "(e.g. [a-zA-Z_][a-zA-Z0-9_]*)",
-                        lineno=node.lineno,
-                        name=self._name,
-                        filename=self._filename,
-                    )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
-                    raise err
-                self._collect_blocks(node.body)
-            elif isinstance(node, Region):
-                if not _BLOCK_NAME_RE.match(node.name):
-                    err = TemplateSyntaxError(
-                        f"Invalid region name '{node.name}': must be identifier-like "
-                        "(e.g. [a-zA-Z_][a-zA-Z0-9_]*)",
-                        lineno=node.lineno,
-                        name=self._name,
-                        filename=self._filename,
-                    )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
-                    raise err
-                if node.name in self._blocks:
-                    err = TemplateSyntaxError(
-                        f"Duplicate block/region name '{node.name}'",
-                        lineno=node.lineno,
-                        name=self._name,
-                        filename=self._filename,
-                    )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
-                    raise err
-                self._blocks[node.name] = node  # Region stored as block for registration
-                self._collect_blocks(node.body)
-            elif isinstance(node, CallBlock):
-                for slot_name in node.slots:
-                    if slot_name != "default" and not _BLOCK_NAME_RE.match(slot_name):
-                        err = TemplateSyntaxError(
-                            f"Invalid slot name '{slot_name}': must be identifier-like "
-                            "(e.g. [a-zA-Z_][a-zA-Z0-9_]*)",
-                            lineno=node.lineno,
-                            name=self._name,
-                            filename=self._filename,
-                        )
-                        err.code = ErrorCode.INVALID_IDENTIFIER
-                        raise err
-                for slot_body in node.slots.values():
-                    self._collect_blocks(slot_body)
-            elif isinstance(node, SlotBlock):
-                if node.name != "default" and not _BLOCK_NAME_RE.match(node.name):
-                    err = TemplateSyntaxError(
-                        f"Invalid slot name '{node.name}': must be identifier-like "
-                        "(e.g. [a-zA-Z_][a-zA-Z0-9_]*)",
-                        lineno=node.lineno,
-                        name=self._name,
-                        filename=self._filename,
-                    )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
-                    raise err
-                self._collect_blocks(node.body)
-            elif isinstance(node, Slot):
-                if node.name != "default" and not _BLOCK_NAME_RE.match(node.name):
-                    err = TemplateSyntaxError(
-                        f"Invalid slot name '{node.name}': must be identifier-like "
-                        "(e.g. [a-zA-Z_][a-zA-Z0-9_]*)",
-                        lineno=node.lineno,
-                        name=self._name,
-                        filename=self._filename,
-                    )
-                    err.code = ErrorCode.INVALID_IDENTIFIER
-                    raise err
-            elif hasattr(node, "body"):
-                # Node has a body (If, For, With, Def, etc.)
-                body = node.body
+                # Top-level definition: track for runtime hint suggestions.
+                self._declared_definitions.add(node.name)
+                # Recurse into the def/region body without adding to chain —
+                # nested helpers inside a def are not render_block targets,
+                # so the same rule does not apply transitively.
+                self._check_definition_nesting(node.body, parent_chain)
+                continue
+
+            tag = self._SCOPED_PARENTS.get(type_name)
+            if tag is not None:
+                new_chain = (*parent_chain, tag)
+                # Walk the primary body
+                body = getattr(node, "body", None)
                 if isinstance(body, Sequence):
-                    self._collect_blocks(cast("Sequence[Node]", body))
-                # Check for else/elif bodies
+                    self._check_definition_nesting(cast("Sequence[Node]", body), new_chain)
+                # Also walk else_/elif_/empty/fallback branches
                 else_ = getattr(node, "else_", None)
                 if isinstance(else_, Sequence):
-                    self._collect_blocks(cast("Sequence[Node]", else_))
+                    self._check_definition_nesting(cast("Sequence[Node]", else_), new_chain)
                 empty = getattr(node, "empty", None)
                 if isinstance(empty, Sequence):
-                    self._collect_blocks(cast("Sequence[Node]", empty))
+                    self._check_definition_nesting(cast("Sequence[Node]", empty), new_chain)
+                fallback = getattr(node, "fallback", None)
+                if isinstance(fallback, Sequence):
+                    self._check_definition_nesting(cast("Sequence[Node]", fallback), new_chain)
                 elif_ = getattr(node, "elif_", None)
                 if elif_:
                     for _, elif_body in elif_:
-                        self._collect_blocks(elif_body)
+                        self._check_definition_nesting(elif_body, new_chain)
+                cases = getattr(node, "cases", None)
+                if cases:
+                    for case_entry in cases:
+                        # Match.cases is Sequence[tuple[Expr, Expr|None, body]]
+                        case_body = case_entry[-1]
+                        if isinstance(case_body, Sequence):
+                            self._check_definition_nesting(
+                                cast("Sequence[Node]", case_body), new_chain
+                            )
+                continue
+
+            # Allowed structural containers (Block, CallBlock, SlotBlock,
+            # Embed): walk their bodies but do not extend parent_chain.
+            if isinstance(node, CallBlock):
+                for slot_body in node.slots.values():
+                    self._check_definition_nesting(slot_body, parent_chain)
+                continue
+            if isinstance(node, (SlotBlock, Embed)):
+                body = getattr(node, "body", None)
+                if isinstance(body, Sequence):
+                    self._check_definition_nesting(cast("Sequence[Node]", body), parent_chain)
+                continue
+            # Generic fallback: traverse any .body attribute.
+            body = getattr(node, "body", None)
+            if isinstance(body, Sequence):
+                self._check_definition_nesting(cast("Sequence[Node]", body), parent_chain)
+
+    def _collect_blocks(self, nodes: Sequence[Node]) -> None:
+        """Populate blocks through the template-structure analysis phase."""
+        from kida.compiler.analysis_phases import collect_template_blocks
+
+        self._blocks = collect_template_blocks(
+            nodes,
+            template_name=self._name,
+            filename=self._filename,
+        )
 
     def compile(
         self,
@@ -450,12 +471,44 @@ class Compiler(
         self._outer_caller_expr = None  # Set when compiling call body inside def
         self._precomputed = []  # Reset precomputed for each compilation
         self._precomputed_ids = {}
+        self._declared_definitions = set()
+        self._loop_usage_cache = {}
+
+        # Validate top-level placement of {% def %} / {% region %}: nesting
+        # inside control-flow constructs (if/for/with/provide/...) prevents
+        # _globals_setup from binding the name for render_block() dispatch.
+        self._check_definition_nesting(node.body, parent_chain=())
+
+        if self._env.jinja2_compat_warnings:
+            from kida.compiler.analysis_phases import collect_jinja_set_read_findings
+            from kida.exceptions import ErrorCode
+
+            for finding in collect_jinja_set_read_findings(node.body):
+                if finding.shadow:
+                    message = (
+                        f"{{% set %}} assigns to '{finding.name}' which is already "
+                        "bound in the surrounding scope. In Kida, this creates a "
+                        "block-scoped shadow; Jinja2 {% if %} does not create a scope."
+                    )
+                else:
+                    message = (
+                        f"{{% set %}} assigns to '{finding.name}' inside a Jinja2 "
+                        "{% if %} scope, and that binding is read after the block. "
+                        "Jinja2 leaks the assignment through {% if %}; Kida keeps "
+                        "it block-scoped."
+                    )
+                self._emit_warning(
+                    ErrorCode.JINJA2_SET_SCOPING,
+                    message,
+                    lineno=finding.lineno,
+                    suggestion=finding.suggestion,
+                )
 
         # Generate Python AST
         module = self._compile_template(node)
 
         # Fix missing locations for Python 3.8+
-        ast.fix_missing_locations(module)
+        fix_missing_locations_fast(module)
 
         # Compile to code object
         return compile(
@@ -484,6 +537,26 @@ class Compiler(
                 keywords=[],
             ),
         )
+
+    @contextmanager
+    def _lowering_mode(
+        self,
+        *,
+        streaming: bool | None = None,
+        async_mode: bool | None = None,
+    ) -> Iterator[None]:
+        """Temporarily select compiler lowering flags and always restore them."""
+        saved_streaming = self._streaming
+        saved_async_mode = self._async_mode
+        if streaming is not None:
+            self._streaming = streaming
+        if async_mode is not None:
+            self._async_mode = async_mode
+        try:
+            yield
+        finally:
+            self._streaming = saved_streaming
+            self._async_mode = saved_async_mode
 
     def _compile_template(self, node: TemplateNode) -> ast.Module:
         """Generate Python module from template.
@@ -524,118 +597,28 @@ class Compiler(
         if globals_setup is not None:
             module_body.append(globals_setup)
 
-        # Generate all three block function variants (sync, stream, async stream).
-        # Regular blocks compile the Kida body once (sync), then derive stream
-        # variants via Python AST transformation (_append → yield), eliminating
-        # 2 redundant Kida AST compilations per block.
-        # Region blocks use their own delegation path and are unaffected.
-        from kida.compiler.stream_transform import sync_body_to_stream
-
         sync_blocks: list[ast.stmt] = []
         stream_blocks: list[ast.stmt] = []
         async_stream_blocks: list[ast.stmt] = []
+        has_regions = any(isinstance(block_node, Region) for block_node in saved_blocks.values())
 
         for block_name, block_node in saved_blocks.items():
-            # Reset per-block flag before sync compilation
-            self._block_has_append_rebind = False
-            sync_blocks.append(self._make_block_function(block_name, block_node))
-
-            if isinstance(block_node, Region):
-                # Region blocks: compile separately (they delegate, not compile body)
-                self._streaming = True
-                stream_blocks.append(self._make_block_function_stream(block_name, block_node))
-                self._async_mode = True
-                async_stream_blocks.append(
-                    self._make_block_function_stream_async(block_name, block_node)
-                )
-                self._async_mode = False
-                self._streaming = False
-            else:
-                # Regular blocks: reuse sync body compilation saved by
-                # _make_block_function, transform for streaming.
-                compiled_stmts = self._last_block_compiled_stmts or []
-
-                if self._block_has_append_rebind:
-                    # Block rebinds _append (capture/cache/spaceless/push) —
-                    # fall back to dedicated stream compilation so that the
-                    # _append → yield transform does not leak captured content.
-                    self._streaming = True
-                    stream_blocks.append(self._make_block_function_stream(block_name, block_node))
-                    self._async_mode = True
-                    async_stream_blocks.append(
-                        self._make_block_function_stream_async(block_name, block_node)
-                    )
-                    self._async_mode = False
-                    self._streaming = False
-                else:
-                    stream_stmts = sync_body_to_stream(compiled_stmts)
-
-                    # Build stream block function
-                    stream_body: list[ast.stmt] = self._make_block_preamble(streaming=True)
-                    stream_body.extend(stream_stmts)
-                    stream_body.append(ast.Return(value=None))
-                    stream_body.append(ast.Expr(value=ast.Yield(value=None)))
-                    stream_blocks.append(
-                        ast.FunctionDef(
-                            name=f"_block_{block_name}_stream",
-                            args=ast.arguments(
-                                posonlyargs=[],
-                                args=[ast.arg(arg="ctx"), ast.arg(arg="_blocks")],
-                                vararg=None,
-                                kwonlyargs=[],
-                                kw_defaults=[],
-                                kwarg=None,
-                                defaults=[],
-                            ),
-                            body=stream_body,
-                            decorator_list=[],
-                            returns=None,
-                        )
-                    )
-
-                    # Async stream: if template has async constructs, must compile
-                    # separately (AsyncFor → ast.AsyncFor requires _async_mode=True).
-                    # Otherwise, derive from sync body transform.
-                    if self._has_async:
-                        self._streaming = True
-                        self._async_mode = True
-                        async_stream_blocks.append(
-                            self._make_block_function_stream_async(block_name, block_node)
-                        )
-                        self._async_mode = False
-                        self._streaming = False
-                    else:
-                        async_stmts = sync_body_to_stream(compiled_stmts)
-                        async_body: list[ast.stmt] = self._make_block_preamble(streaming=True)
-                        async_body.extend(async_stmts)
-                        async_body.append(ast.Return(value=None))
-                        async_body.append(ast.Expr(value=ast.Yield(value=None)))
-                        async_stream_blocks.append(
-                            ast.AsyncFunctionDef(
-                                name=f"_block_{block_name}_stream_async",
-                                args=ast.arguments(
-                                    posonlyargs=[],
-                                    args=[ast.arg(arg="ctx"), ast.arg(arg="_blocks")],
-                                    vararg=None,
-                                    kwonlyargs=[],
-                                    kw_defaults=[],
-                                    kwarg=None,
-                                    defaults=[],
-                                ),
-                                body=async_body,
-                                decorator_list=[],
-                                returns=None,
-                            )
-                        )
+            variants = self._lower_block_function_variants(
+                block_name,
+                block_node,
+                template_has_regions=has_regions,
+            )
+            sync_blocks.append(variants.sync)
+            stream_blocks.append(variants.stream)
+            async_stream_blocks.append(variants.async_stream)
 
         module_body.extend(sync_blocks)
         module_body.append(render_func)
 
         # Streaming render function
-        self._streaming = True
-        module_body.extend(stream_blocks)
-        module_body.append(self._make_render_function_stream(node, saved_blocks))
-        self._streaming = False
+        with self._lowering_mode(streaming=True):
+            module_body.extend(stream_blocks)
+            module_body.append(self._make_render_function_stream(node, saved_blocks))
 
         # Always generate async streaming variants so async blocks from child
         # templates can be dispatched through sync parent templates.
@@ -649,20 +632,80 @@ class Compiler(
                 )
             )
 
-        # Async streaming render function (generated for ALL templates).
-        # For sync templates, these wrap sync code in async def.
-        # This ensures every parent template has render_stream_async for
-        # inheritance chains where a child introduces async constructs.
-        self._streaming = True
-        self._async_mode = True
-        module_body.extend(async_stream_blocks)
-        module_body.append(self._make_render_function_stream_async(node, saved_blocks))
-        self._async_mode = False
-        self._streaming = False
+        # Async streaming render function. Sync leaf templates do not need an
+        # async wrapper because Template.render_stream_async() falls back to
+        # render_stream(). Keep wrappers for async templates and inheritance
+        # participants so async child blocks can flow through sync parents.
+        needs_async_stream = self._has_async or bool(saved_blocks) or extends_target is not None
+        if needs_async_stream:
+            with self._lowering_mode(streaming=True, async_mode=True):
+                module_body.extend(async_stream_blocks)
+                module_body.append(self._make_render_function_stream_async(node, saved_blocks))
 
         return ast.Module(
             body=module_body,
             type_ignores=[],
+        )
+
+    def _lower_block_function_variants(
+        self,
+        name: str,
+        block_node: Block | Region,
+        *,
+        template_has_regions: bool,
+    ) -> BlockFunctionVariants:
+        """Lower one block into its sync, stream, and async-stream functions."""
+        from kida.compiler.stream_transform import (
+            BlockFunctionVariants,
+            BlockLoweringStrategy,
+            build_async_stream_block_function,
+            build_stream_block_function,
+            plan_block_render_modes,
+        )
+
+        self._block_has_append_rebind = False
+        sync_block = self._make_block_function(name, block_node)
+        mode_plan = plan_block_render_modes(
+            is_region=isinstance(block_node, Region),
+            rebinds_append=self._block_has_append_rebind,
+            template_has_regions=template_has_regions,
+            template_has_async=self._has_async,
+        )
+
+        if mode_plan.stream is BlockLoweringStrategy.COMPILE_DIRECT:
+            # Region, capture/cache, and region-bearing block variants need
+            # dedicated streaming compilation rather than AST transformation.
+            # A direct stream plan always implies direct async-stream lowering.
+            with self._lowering_mode(streaming=True):
+                stream_block = self._make_block_function_stream(name, block_node)
+                with self._lowering_mode(async_mode=True):
+                    async_stream_block = self._make_block_function_stream_async(name, block_node)
+        else:
+            # Reuse sync body compilation saved by _make_block_function.
+            compiled_stmts = self._last_block_compiled_stmts or []
+            stream_block = build_stream_block_function(
+                name,
+                preamble=self._make_block_preamble(streaming=True),
+                cache_assignments=self._emit_cache_assignments(self._last_block_cacheable_vars),
+                compiled_stmts=compiled_stmts,
+            )
+
+            if mode_plan.async_stream is BlockLoweringStrategy.COMPILE_DIRECT:
+                # Async syntax must be lowered while async mode is active.
+                with self._lowering_mode(streaming=True, async_mode=True):
+                    async_stream_block = self._make_block_function_stream_async(name, block_node)
+            else:
+                async_stream_block = build_async_stream_block_function(
+                    name,
+                    preamble=self._make_block_preamble(streaming=True),
+                    cache_assignments=self._emit_cache_assignments(self._last_block_cacheable_vars),
+                    compiled_stmts=compiled_stmts,
+                )
+
+        return BlockFunctionVariants(
+            sync=sync_block,
+            stream=stream_block,
+            async_stream=async_stream_block,
         )
 
     def _make_globals_setup(self, node: TemplateNode) -> ast.FunctionDef | None:
@@ -676,7 +719,7 @@ class Compiler(
         into the block's context. Returns None if neither globals nor top-level
         imports exist.
         """
-        from kida.nodes import Def, FromImport, Globals, Import, Imports, Let
+        from kida.nodes import Globals, Imports
 
         # Single-pass classification instead of 5 separate list comprehensions
         setup_nodes: list[Any] = []
@@ -770,6 +813,7 @@ class Compiler(
         include_buf_append: bool = False,
         include_acc: bool = False,
         acc_none: bool = False,
+        include_cap: bool = False,
         include_lookup_scope: bool = False,
         include_render_ctx: bool = False,
     ) -> list[ast.stmt]:
@@ -871,6 +915,17 @@ class Compiler(
                     value=acc_value,
                 )
             )
+        if include_cap:
+            stmts.append(
+                ast.Assign(
+                    targets=[ast.Name(id="_cap", ctx=ast.Store())],
+                    value=ast.Call(
+                        func=ast.Name(id="_get_capture", ctx=ast.Load()),
+                        args=[],
+                        keywords=[],
+                    ),
+                )
+            )
         if include_render_ctx:
             # Cache render context as _rc for LOAD_FAST instead of
             # calling ContextVar.get() on every line-tracked node.
@@ -900,6 +955,7 @@ class Compiler(
         Non-streaming adds buf and _append for StringBuilder.
         """
         profiling = self._env.enable_profiling
+        capturing = self._env.enable_capture
         return self._make_runtime_preamble(
             include_scope_stack=True,
             include_escape_str=True,
@@ -907,6 +963,7 @@ class Compiler(
             include_lookup_scope=True,
             include_buf_append=not streaming,
             include_acc=profiling,
+            include_cap=capturing,
             include_render_ctx=True,
         )
 
@@ -987,34 +1044,10 @@ class Compiler(
 
     @staticmethod
     def _has_unconditional_exprs(body: Sequence) -> bool:
-        """Fast check: does the body have any nodes that produce unconditional Name refs?
+        """Delegate the fast CSE guard to its named analysis owner."""
+        from kida.compiler.analysis_phases import has_unconditional_expressions
 
-        Returns False when every top-level node is a control-flow node or Data
-        (raw text), meaning CSE analysis would find no unconditional refs and
-        can be skipped entirely.
-        """
-        from kida.nodes import Data
-
-        # Node types that never produce unconditional Name refs at their level
-        skip = (
-            For,
-            AsyncFor,
-            If,
-            While,
-            Match,
-            Set,
-            Let,
-            Export,
-            Capture,
-            With,
-            WithConditional,
-            Import,
-            FromImport,
-            Def,
-            Block,
-            Data,
-        )
-        return any(not isinstance(n, skip) for n in body)
+        return has_unconditional_expressions(body)
 
     def _analyze_for_cse(self, body_nodes: Sequence) -> set[str]:
         """Combined CSE analysis: returns cacheable variable names.
@@ -1023,190 +1056,16 @@ class Compiler(
         the full variable reference collection in a single call, deduplicating
         the pattern used across _make_block_function and _make_render_direct_body.
         """
-        if not self._has_unconditional_exprs(body_nodes):
-            return set()
-        ref_counts, mutated = self._collect_var_refs(body_nodes)
-        return {
-            n
-            for n, count in ref_counts.items()
-            if count >= 2 and n not in mutated and n not in self._locals
-        }
+        from kida.compiler.analysis_phases import analyze_cacheable_names
+
+        return analyze_cacheable_names(body_nodes, local_names=self._locals)
 
     @staticmethod
     def _collect_var_refs(nodes: Any) -> tuple[dict[str, int], set[str]]:
-        """Collect variable reference counts and mutated names from Kida AST nodes.
+        """Delegate variable traversal to its named analysis owner."""
+        from kida.compiler.analysis_phases import collect_variable_references
 
-        Walks the AST recursively, collecting mutations from ALL code but only
-        counting Name references in unconditional (non-branching) code paths.
-        This ensures eager cache assignments at function entry won't raise
-        UndefinedError for variables only referenced inside conditional branches.
-
-        Does NOT recurse into Block or Def bodies (separate compilation scopes).
-
-        Returns:
-            (ref_counts, mutated) where ref_counts maps var name to usage count
-            in unconditional code, and mutated is the set of names assigned
-            anywhere in the body.
-        """
-        ref_counts: dict[str, int] = {}
-        mutated: set[str] = set()
-
-        def _collect_target_names(target: Any) -> None:
-            """Collect all variable names from a For loop target (simple or tuple)."""
-            if isinstance(target, Name):
-                mutated.add(target.name)
-            elif hasattr(target, "items"):  # KidaTuple
-                for item in target.items:
-                    _collect_target_names(item)
-
-        def _walk(node: Any, *, count_refs: bool = True) -> None:
-            if node is None:
-                return
-            if isinstance(node, (list, tuple)):
-                for item in node:
-                    _walk(item, count_refs=count_refs)
-                return
-            if isinstance(node, dict):
-                for v in node.values():
-                    _walk(v, count_refs=count_refs)
-                return
-
-            # Count Name references only in unconditional code
-            if isinstance(node, Name) and node.ctx == "load":
-                if count_refs:
-                    ref_counts[node.name] = ref_counts.get(node.name, 0) + 1
-                return
-
-            # Track mutations: Set/Let/Export/Capture targets (always, regardless of branch)
-            if isinstance(node, Set):
-                if isinstance(node.target, Name):
-                    mutated.add(node.target.name)
-                _walk(node.value, count_refs=count_refs)
-                return
-            if isinstance(node, Let):
-                if isinstance(node.name, Name):
-                    mutated.add(node.name.name)
-                _walk(node.value, count_refs=count_refs)
-                return
-            if isinstance(node, Export):
-                if isinstance(node.name, Name):
-                    mutated.add(node.name.name)
-                _walk(node.value, count_refs=count_refs)
-                return
-            if isinstance(node, Capture):
-                mutated.add(node.name)
-                _walk(node.body, count_refs=False)
-                return
-
-            # ListComp: target is a local within the comprehension scope;
-            # elt/ifs reference that local, so they must not be counted for caching.
-            # iter is evaluated in the enclosing scope (unconditional).
-            if isinstance(node, ListComp):
-                _collect_target_names(node.target)
-                _walk(node.iter, count_refs=count_refs)
-                _walk(node.elt, count_refs=False)
-                for if_expr in node.ifs:
-                    _walk(if_expr, count_refs=False)
-                return
-
-            # Track For/AsyncFor loop targets — loop vars become Python locals
-            # at runtime and must not be cached at function entry.
-            # Also exclude 'loop' (LoopContext) which is only available inside the body.
-            # For iter expression is unconditional; body/empty are conditional.
-            if isinstance(node, (For, AsyncFor)):
-                _collect_target_names(node.target)
-                mutated.add("loop")
-                _walk(node.iter, count_refs=count_refs)
-                _walk(node.body, count_refs=False)
-                _walk(node.empty, count_refs=False)
-                return
-
-            # With/WithConditional introduce locally-scoped variables
-            if isinstance(node, With):
-                for target_name, expr in node.targets:
-                    mutated.add(target_name)
-                    _walk(expr, count_refs=count_refs)
-                _walk(node.body, count_refs=False)
-                return
-            if isinstance(node, WithConditional):
-                if isinstance(node.target, Name):
-                    mutated.add(node.target.name)
-                _walk(node.expr, count_refs=count_refs)
-                _walk(node.body, count_refs=False)
-                if node.empty:
-                    _walk(node.empty, count_refs=False)
-                return
-
-            # Import/FromImport introduce names into ctx mid-function
-            if isinstance(node, Import):
-                mutated.add(node.target)
-                _walk(node.template, count_refs=count_refs)
-                return
-            if isinstance(node, FromImport):
-                for name, alias in node.names:
-                    mutated.add(alias or name)
-                _walk(node.template, count_refs=count_refs)
-                return
-
-            # If/While: test expression is unconditional, bodies are conditional.
-            if isinstance(node, If):
-                _walk(node.test, count_refs=count_refs)
-                _walk(node.body, count_refs=False)
-                for elif_test, elif_body in node.elif_:
-                    _walk(elif_test, count_refs=False)
-                    _walk(elif_body, count_refs=False)
-                if node.else_:
-                    _walk(node.else_, count_refs=False)
-                return
-            if isinstance(node, While):
-                _walk(node.test, count_refs=count_refs)
-                _walk(node.body, count_refs=False)
-                return
-
-            # Match: subject is unconditional, case bodies are conditional.
-            # Case patterns may bind variables.
-            if isinstance(node, Match):
-                if node.subject is not None:
-                    _walk(node.subject, count_refs=count_refs)
-                for pattern, guard, case_body in node.cases:
-                    _collect_target_names(pattern)
-                    if guard is not None:
-                        _walk(guard, count_refs=False)
-                    _walk(case_body, count_refs=False)
-                return
-
-            # CallBlock slot bodies execute with scoped bindings pushed onto
-            # _scope_stack at runtime.  Variables provided via let: params are
-            # not available at function entry, so references inside slot bodies
-            # must NOT be counted as unconditional — otherwise the CSE cache
-            # assignment (_cv_x = _ls(...)) fires before the binding exists.
-            # The call expression itself IS unconditional.
-            if isinstance(node, CallBlock):
-                _walk(node.call, count_refs=count_refs)
-                for slot_body in node.slots.values():
-                    _walk(slot_body, count_refs=False)
-                return
-
-            # Don't recurse into separate compilation scopes.
-            # Def names are locally defined mid-function — exclude from caching.
-            if isinstance(node, Def):
-                mutated.add(node.name)
-                return
-            if isinstance(node, Block):
-                return
-
-            # Skip non-dataclass types
-            if not hasattr(node, "__dataclass_fields__"):
-                return
-
-            # Recurse into all dataclass fields
-            for field_name in node.__dataclass_fields__:
-                child = getattr(node, field_name, None)
-                if child is not None:
-                    _walk(child, count_refs=count_refs)
-
-        _walk(nodes)
-        return ref_counts, mutated
+        return collect_variable_references(nodes)
 
     def _emit_cache_assignments(self, names: set[str]) -> list[ast.stmt]:
         """Emit _cv_name = _ls(ctx, _scope_stack, 'name') for each cached variable."""
@@ -1269,6 +1128,7 @@ class Compiler(
         return None
 
     # Stores compiled stmts from the last _make_block_function call for stream reuse
+    _last_block_cacheable_vars: set[str]
     _last_block_compiled_stmts: list[ast.stmt] | None
 
     def _make_block_function(self, name: str, block_node: Block | Region) -> ast.FunctionDef:
@@ -1278,6 +1138,7 @@ class Compiler(
         so the stream variant can be derived without recompiling the Kida AST.
         """
         self._last_block_compiled_stmts = None
+        self._last_block_cacheable_vars = set()
         if isinstance(block_node, Region):
             return self._make_region_block_function(name, block_node)
 
@@ -1285,6 +1146,7 @@ class Compiler(
         body_nodes = list(block_node.body)
         self._last_block_body_nodes = body_nodes
         cacheable = self._analyze_for_cse(body_nodes)
+        self._last_block_cacheable_vars = cacheable
         saved_cached = self._cached_vars
         self._cached_vars = cacheable
 
@@ -1345,6 +1207,7 @@ class Compiler(
             if expr is not None:
                 # Minimal preamble: _e, _s, _ga, _ls, _rc but no buf/_append.
                 profiling = self._env.enable_profiling
+                capturing = self._env.enable_capture
                 preamble = self._make_runtime_preamble(
                     include_scope_stack=True,
                     include_escape_str=True,
@@ -1352,6 +1215,7 @@ class Compiler(
                     include_lookup_scope=True,
                     include_buf_append=False,
                     include_acc=profiling,
+                    include_cap=capturing,
                     include_render_ctx=True,
                 )
                 cache_stmts = self._emit_cache_assignments(cacheable)
@@ -1405,14 +1269,16 @@ class Compiler(
         )
 
     def _make_render_preamble(self) -> list[ast.stmt]:
-        """Shared init block for render functions: if _blocks, _scope_stack, _acc."""
+        """Shared init block for render functions: if _blocks, _scope_stack, _acc, _cap."""
         profiling = self._env.enable_profiling
+        capturing = self._env.enable_capture
         return self._make_runtime_preamble(
             include_blocks_guard=True,
             include_scope_stack=True,
             include_getattr=True,
             include_lookup_scope=True,
             include_acc=profiling,
+            include_cap=capturing,
             include_render_ctx=True,
         )
 
@@ -1762,47 +1628,6 @@ class Compiler(
             returns=None,
         )
 
-    # Node types that can cause runtime errors and should track line numbers
-    _LINE_TRACKED_NODES = frozenset(
-        {
-            "Output",  # Expression evaluation
-            "For",  # Iterator access, filter application
-            "AsyncFor",  # Async iterator access (RFC: rfc-async-rendering)
-            "If",  # Boolean coercion, attribute access
-            "Match",  # Pattern matching
-            "Set",  # Expression evaluation
-            "Let",  # Expression evaluation
-            "CallBlock",  # Function calls
-            "Do",  # Side-effect expressions
-            "WithConditional",  # Conditional with block (expression evaluation)
-            "Include",  # Template inclusion (errors in included templates)
-            "FromImport",  # Template import (macro/function access)
-            "Import",  # Template import
-            "Embed",  # Template embedding
-        }
-    )
-
-    def _make_line_marker(self, lineno: int) -> ast.stmt:
-        """Generate RenderContext line update for error tracking.
-
-        Generates: _rc.line = lineno
-
-        Uses the cached _rc local (set in preamble) instead of calling
-        _get_render_ctx() per node, avoiding repeated ContextVar.get() calls.
-
-        RFC: kida-contextvar-patterns
-        """
-        return ast.Assign(
-            targets=[
-                ast.Attribute(
-                    value=ast.Name(id="_rc", ctx=ast.Load()),
-                    attr="line",
-                    ctx=ast.Store(),
-                )
-            ],
-            value=ast.Constant(value=lineno),
-        )
-
     @staticmethod
     def _compile_template_context(_node: Node) -> list[ast.stmt]:
         """No-op: TemplateContext is a declaration, not code."""
@@ -1821,8 +1646,8 @@ class Compiler(
 
         # Inject line marker for risky nodes
         stmts: list[ast.stmt] = []
-        if node_type in self._LINE_TRACKED_NODES:
-            stmts.append(self._make_line_marker(node.lineno))
+        if node_type in LINE_TRACKED_NODE_TYPES:
+            stmts.append(make_line_marker(node.lineno))
 
         # Dispatch table — O(1) lookup, unbound functions called with self
         handler = self._node_dispatch.get(node_type)

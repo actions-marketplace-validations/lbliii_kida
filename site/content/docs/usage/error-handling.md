@@ -44,6 +44,22 @@ from kida import (
 )
 ```
 
+For editor, CI, or framework integration, use the public programmatic
+diagnostics API instead of parsing exception strings:
+
+```python
+from kida.diagnostics import diagnostic_from_exception
+
+try:
+    template.render()
+except TemplateError as error:
+    finding = diagnostic_from_exception(error)
+    print(finding.code, finding.span, finding.suggestion)
+```
+
+See [Programmatic Diagnostics](/docs/reference/api/#programmatic-diagnostics)
+for in-memory source and directory-wide collection.
+
 ## Syntax Errors
 
 ```python
@@ -148,7 +164,7 @@ When an error occurs inside a `{% def %}` component, `TemplateRuntimeError` and 
 try:
     template.render(data=data)
 except TemplateRuntimeError as e:
-    for def_name, lineno, tpl_name in e.component_stack:
+    for tpl_name, lineno, def_name in e.component_stack:
         print(f"  in {def_name}() at {tpl_name}:{lineno}")
 ```
 
@@ -162,7 +178,7 @@ Kida emits Python warnings during template compilation for common pitfalls:
 |---------|------|---------|
 | `PrecedenceWarning` | K-WARN-001 | `x ?? [] \| length` — filter pipe binds tighter than `??` |
 | `CoercionWarning` | — | `"abc" \| float` — silent type coercion to `0.0` |
-| `MigrationWarning` | K-WARN-002 | `{% set %}` inside blocks when `jinja2_compat_warnings=True` |
+| `MigrationWarning` | K-WARN-002 | Jinja `if`-local `{% set %}` flow differs from Kida block scope (default-on; disable via `jinja2_compat_warnings=False`) |
 
 Access warnings on a compiled template:
 
@@ -172,32 +188,68 @@ for w in template.warnings:
     print(f"{w.code}: {w.message} (line {w.lineno})")
 ```
 
+`kida check`, `diagnose_source()`, and `diagnose_directory()` also include
+code-bearing compiler warnings in the shared structured-diagnostics collection.
+Text, diagnostics JSON v1, and SARIF preserve the same path, line, suggestion,
+and confidence. These advisory findings do not include automatic edits.
+
 These are standard Python warnings — filter them with `warnings.filterwarnings("ignore", category=PrecedenceWarning)`.
 
 ## Error Codes
 
-Every Kida exception carries an `ErrorCode` that categorizes the error and links to documentation:
+Kida exceptions and registered static-analysis findings use `ErrorCode` values
+that categorize the diagnostic and link to documentation:
 
 | Code | Category | Description |
 |------|----------|-------------|
-| `K-LEX-001` | Lexer | Unterminated string literal |
-| `K-LEX-002` | Lexer | Invalid character in template |
+| `K-LEX-001` | Lexer | Unclosed tag |
+| `K-LEX-002` | Lexer | Unclosed comment |
+| `K-LEX-003` | Lexer | Unclosed variable |
+| `K-LEX-004` | Lexer | Token limit exceeded |
 | `K-PAR-001` | Parser | Unexpected token |
 | `K-PAR-002` | Parser | Unclosed block tag |
 | `K-PAR-003` | Parser | Invalid expression |
+| `K-PAR-004` | Parser | Invalid filter |
+| `K-PAR-005` | Parser | Invalid test |
 | `K-PAR-006` | Parser | Invalid identifier (hyphen in block/fragment name) |
+| `K-PAR-007` | Parser | Unsupported syntax |
 | `K-RUN-001` | Runtime | Undefined variable |
-| `K-RUN-002` | Runtime | Type error in expression |
-| `K-RUN-003` | Runtime | Index out of range |
-| `K-RUN-004` | Runtime | Filter execution error |
+| `K-RUN-002` | Runtime | Filter execution error |
+| `K-RUN-003` | Runtime | Test execution error |
+| `K-RUN-004` | Runtime | Required value was None or missing |
+| `K-RUN-005` | Runtime | None comparison |
+| `K-RUN-006` | Runtime | Include depth exceeded |
+| `K-RUN-007` | Runtime | Generic runtime error |
+| `K-RUN-008` | Runtime | Macro not found |
+| `K-RUN-009` | Runtime | Key error |
+| `K-RUN-010` | Runtime | Attribute error |
+| `K-RUN-011` | Runtime | Division by zero |
+| `K-RUN-012` | Runtime | Type error |
+| `K-RUN-013` | Runtime | Macro iteration |
+| `K-RUN-014` | Runtime | Environment garbage collected |
+| `K-RUN-015` | Runtime | Template not compiled |
+| `K-RUN-016` | Runtime | No loader configured |
+| `K-RUN-017` | Runtime | Not in render context |
 | `K-TPL-001` | Template | Template not found |
 | `K-TPL-002` | Template | Template syntax error |
 | `K-TPL-003` | Template | Circular macro import |
+| `K-TPL-004` | Template | Definition not top-level |
+| `K-TPL-005` | Template | Invalid or ambiguous explicit template-root configuration |
 | `K-SEC-001` | Security | Blocked attribute access |
 | `K-SEC-002` | Security | Blocked type access |
 | `K-SEC-003` | Security | Range limit exceeded |
 | `K-SEC-004` | Security | Blocked callable |
 | `K-SEC-005` | Security | Output limit exceeded |
+| `K-CMP-001` | Component | Component call signature mismatch |
+| `K-CMP-002` | Component | Component literal type mismatch |
+| `K-WARN-001` | Warning | Filter precedence warning |
+| `K-WARN-002` | Warning | Jinja2 `set` scoping difference |
+| `K-PRI-001`–`005` | Privacy | Sensitive paths, secret literals, trust boundaries, broad output, dynamic templates |
+| `K-CTX-001`–`002` | Context | Missing or unused context-contract paths |
+| `K-ESC-001`–`005` | Escape | Escaped output and trusted/unescaped markup boundaries |
+| `K-A11Y-001`–`004` | Accessibility | Alternative text, heading order, document language, form labels |
+| `K-TYP-001`–`003` | Type | Undeclared, unused, or likely misspelled template variables |
+| `K-PATH-001` | Path | Fragile same-folder template reference |
 
 Access the code programmatically:
 
@@ -207,7 +259,7 @@ from kida import UndefinedError, ErrorCode
 try:
     template.render()
 except UndefinedError as e:
-    print(e.code)        # ErrorCode.K_RUN_001
+    print(e.code)        # ErrorCode.UNDEFINED_VARIABLE
     print(e.code.value)  # "K-RUN-001"
 ```
 
@@ -244,7 +296,23 @@ The compact format includes:
 - **Hint** with suggestions (typo corrections, `default` filter usage)
 - **Docs link** to the relevant error code documentation
 
-This is the recommended format for frameworks that wrap Kida errors (like Chirp and Bengal).
+Use `format_compact()` for terminal output and logs. Framework debug pages should
+prefer `UndefinedError.to_diagnostic()` so they can render the same code,
+location, source snippet, hints, documentation URL, template stack, and component
+stack without parsing terminal text.
+
+```python
+from kida import UndefinedError
+
+try:
+    template.render()
+except UndefinedError as exc:
+    diagnostic = exc.to_diagnostic()
+    html = diagnostic.format_html_page()
+```
+
+The diagnostic payload stores plain strings. HTML, Markdown, and terminal
+escaping happen only in the final renderer.
 
 ## Source Snippets
 
@@ -260,7 +328,8 @@ except UndefinedError as e:
     if snippet:
         print(snippet.lines)       # List of (line_number, line_text) tuples
         print(snippet.error_line)  # The line number with the error
-        print(snippet.filename)    # Template filename
+        print(e.template)          # Template name
+        print(e.lineno)            # Error line
 ```
 
 You can also build snippets manually with `build_source_snippet()`:
@@ -284,10 +353,22 @@ Fix: Check for typos, ensure variable is passed to render().
 ### Attribute Error
 
 ```
-UndefinedError: 'dict' object has no attribute 'nmae'
+UndefinedError: Undefined attribute/key 'User.nmae' in page.html:5
 ```
 
 Fix: Check attribute spelling, verify object type.
+
+## Reading Template and Component Stacks
+
+`template_stack` explains how rendering reached another template through
+`include`, `extends`, or imported macros. `component_stack` explains which
+`{% def %}` components were active. In an HTML error view, show the source
+location first, then these stacks as supporting context. Python traceback frames
+from generated code are secondary.
+
+For imported components with slots, Kida reports slot-body errors against the
+caller template while still keeping the imported component path in the component
+stack.
 
 ### Type Error in Filter
 

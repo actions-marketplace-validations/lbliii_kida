@@ -1,0 +1,113 @@
+name: Downstream canaries
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downstream-canaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  downstream:
+    name: ${{ matrix.name }} (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: chirp-ui
+            repository: lbliii/chirp-ui
+            ref: d06ea60536ee8b909ae8a23815799d018809742d
+          - name: milo-cli
+            repository: lbliii/milo-cli
+            ref: 085526215cdec5a9a9dfc2c59ed589b97ec645ff
+          - name: chirp-multi-root
+            repository: lbliii/chirp
+            ref: 3e56ce273cf6ec3cb73c6ce8decef2f78e6dc1f5
+
+    steps:
+      - name: Check out Kida
+        uses: actions/checkout@v7
+        with:
+          path: kida
+          persist-credentials: false
+
+      - name: Check out downstream
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: downstream
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14t"
+
+      - name: Install downstream development dependencies
+        if: matrix.name != 'chirp-multi-root'
+        working-directory: downstream
+        run: uv sync --group dev
+
+      - name: Install minimal Chirp pilot dependencies
+        if: matrix.name == 'chirp-multi-root'
+        working-directory: downstream
+        run: |
+          uv venv --python 3.14t
+          uv pip install --python .venv/bin/python --no-deps --editable .
+          uv pip install --python .venv/bin/python pytest pytest-asyncio
+
+      - name: Override released Kida with this checkout
+        run: |
+          uv pip install --python downstream/.venv/bin/python --no-deps --editable ./kida
+          downstream/.venv/bin/python kida/scripts/verify_downstream_override.py \
+            --checkout "$GITHUB_WORKSPACE/kida"
+
+      - name: Run chirp-ui unit contracts
+        if: matrix.name == 'chirp-ui'
+        working-directory: downstream
+        env:
+          CI: "true"
+          PYTHON_GIL: "0"
+        run: uv run --no-sync pytest tests/ -x -q
+
+      - name: Run Milo unit contracts
+        if: matrix.name == 'milo-cli'
+        working-directory: downstream
+        env:
+          CI: "true"
+          PYTHON_GIL: "0"
+        run: uv run --no-sync pytest -q
+
+      - name: Run Chirp multi-root pilot
+        if: matrix.name == 'chirp-multi-root'
+        working-directory: downstream
+        env:
+          CHIRP_KIDA_MULTI_ROOT_PILOT: "1"
+          CI: "true"
+          PYTHON_GIL: "0"
+        run: uv run --no-sync pytest tests/templating/test_kida_multi_root_pilot.py -q
+
+      - name: Record canary provenance
+        if: always()
+        working-directory: downstream
+        run: |
+          echo "## ${{ matrix.name }} downstream canary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Kida: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Downstream: \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Downstream pin: \`${{ matrix.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Python: 3.14t with \`PYTHON_GIL=0\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Policy: report only; failures must be investigated before high-risk compiler merges" >> "$GITHUB_STEP_SUMMARY"

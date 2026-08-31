@@ -3,13 +3,13 @@
 Provides mixin for compiling variable assignment statements (set, let, export).
 
 Uses inline TYPE_CHECKING declarations for host attributes.
-See: plan/rfc-mixin-protocol-typing.md
+See: docs/design/rfc-mixin-protocol-typing.md
 """
 
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from kida.nodes import Export, Let, Node, Set
@@ -29,9 +29,12 @@ class VariableAssignmentMixin:
     if TYPE_CHECKING:
         # Host attributes (from Compiler.__init__)
         _block_counter: int
+        _env: Any
 
         # From ExpressionCompilationMixin
         def _compile_expr(self, node: Node, store: bool = False) -> ast.expr: ...
+
+        def _make_deferred_lambda(self, expr: ast.expr) -> ast.Lambda: ...
 
     def _compile_set(self, node: Set) -> list[ast.stmt]:
         """Compile {% set %} - block-scoped variable assignment.
@@ -47,16 +50,6 @@ class VariableAssignmentMixin:
         With ??=, assigns only if the variable is undefined or None:
             {% set x ??= "default" %}
         """
-        if self._scope_depth > 0 and self._env.jinja2_compat_warnings:
-            from kida.exceptions import ErrorCode
-
-            self._emit_warning(
-                ErrorCode.JINJA2_SET_SCOPING,
-                "{% set %} is block-scoped in Kida (does not leak to outer scope). "
-                "In Jinja2, {% set %} would modify the outer variable.",
-                lineno=node.lineno,
-                suggestion="Use {% export %} to write to outer scope, or {% let %} for template-wide assignment.",
-            )
         stmts = self._compile_block_scoped_assignment(node.target, node.value)
         if node.coalesce:
             return self._wrap_coalesce_guard(node.target, stmts)

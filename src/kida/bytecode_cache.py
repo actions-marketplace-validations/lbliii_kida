@@ -1,8 +1,8 @@
 """Template Bytecode Cache.
 
 Persists compiled template code objects to disk for near-instant
-cold-start loading. Uses marshal for code object serialization and
-pickle for optional AST serialization.
+cold-start loading. Uses marshal for code object serialization, JSON for
+compiler-warning facts, and pickle for optional compiler-owned data.
 
 Cache Invalidation:
 Uses source hash in filename. When source changes, hash changes,
@@ -34,12 +34,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import marshal
 import pickle
+import re
 import struct
 import sys
 import time
+from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, cast
@@ -49,8 +53,10 @@ from kida.utils.template_keys import normalize_template_name
 logger = logging.getLogger("kida.bytecode_cache")
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from types import CodeType
 
+    from kida.exceptions import TemplateWarning
     from kida.nodes.base import Node
 
 # Magic sentinel that prefixes the framed cache format (v2).
@@ -63,8 +69,35 @@ _FRAMED_MAGIC = b"\x00KDA"
 # pc_len is 0 when there are no precomputed values.
 _FRAMED_MAGIC_V3 = b"\x01KDA"
 
+# v4 magic: carries compiler warning facts as a length-delimited JSON section.
+# Format: magic + code_len + code + pc_len + pickle(precomputed)
+#         + warnings_len + JSON(warnings) + pickle(ast)?
+_FRAMED_MAGIC_V4 = b"\x02KDA"
+
 # Python version tag for cache invalidation across Python upgrades
 _PY_VERSION_TAG = f"py{sys.version_info.major}{sys.version_info.minor}"
+
+# Cache ABI tag for Kida compiler/AST changes. Bytecode cache entries contain
+# compiled Python code and, optionally, pickled Kida AST nodes; both are tied to
+# the engine version and to AST dataclass shape.
+try:
+    _KIDA_VERSION_TAG = re.sub(r"[^A-Za-z0-9]+", "_", version("kida-templates")).strip("_")
+except PackageNotFoundError:  # pragma: no cover - package metadata may be absent in ad-hoc embeds
+    _KIDA_VERSION_TAG = "unknown"
+_CACHE_ABI_TAG = f"{_PY_VERSION_TAG}_kida{_KIDA_VERSION_TAG}_ast2_warn1"
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedArtifact:
+    """One validated cache record, including private diagnostic metadata."""
+
+    code: CodeType
+    ast: Node | None
+    precomputed: list | None
+    compiler_warnings: tuple[TemplateWarning, ...] | None
+
+
+_INCOMPATIBLE_AST = object()
 
 
 class BytecodeCache:
@@ -122,7 +155,7 @@ class BytecodeCache:
         if context_hash:
             hash_key = f"{hash_key}_{context_hash[:16]}"
         filename = self._pattern.format(
-            version=_PY_VERSION_TAG,
+            version=_CACHE_ABI_TAG,
             name=safe_name,
             hash=hash_key,
         )
@@ -142,6 +175,8 @@ class BytecodeCache:
         - v2 format: ``_FRAMED_MAGIC`` sentinel, code length, code, optional AST.
         - v3 format: ``_FRAMED_MAGIC_V3`` sentinel, code length, code,
           precomputed length, precomputed constants, optional AST.
+        - v4 format: ``_FRAMED_MAGIC_V4`` sentinel plus a length-delimited
+          compiler-warning metadata section before the optional AST.
 
         Args:
             name: Template name
@@ -152,17 +187,85 @@ class BytecodeCache:
             ``precomputed`` may be ``None``.  Returns ``(None, None, None)``
             on a cache miss or read error.
         """
+        artifact = self._get_artifact(name, source_hash, context_hash=context_hash)
+        if artifact is None:
+            return None, None, None
+        return artifact.code, artifact.ast, artifact.precomputed
+
+    def _get_artifact(
+        self,
+        name: str,
+        source_hash: str,
+        *,
+        context_hash: str | None = None,
+    ) -> _CachedArtifact | None:
+        """Load one cache artifact with private compiler-warning metadata."""
         path = self._make_path(name, source_hash, context_hash)
 
         if not path.exists():
-            return None, None, None
+            return None
 
         try:
             data = path.read_bytes()
         except OSError:
-            return None, None, None
+            return None
 
         try:
+            if data[: len(_FRAMED_MAGIC_V4)] == _FRAMED_MAGIC_V4:
+                offset = len(_FRAMED_MAGIC_V4)
+                (code_len,) = struct.unpack_from("<I", data, offset)
+                offset += 4
+                code_bytes = data[offset : offset + code_len]
+                if len(code_bytes) != code_len:
+                    _discard_cache_path(path)
+                    return None
+                code = cast("CodeType", marshal.loads(code_bytes))
+                offset += code_len
+
+                (pc_len,) = struct.unpack_from("<I", data, offset)
+                offset += 4
+                precomputed: list | None = None
+                if pc_len > 0:
+                    pc_bytes = data[offset : offset + pc_len]
+                    if len(pc_bytes) != pc_len:
+                        _discard_cache_path(path)
+                        return None
+                    try:
+                        precomputed = pickle.loads(pc_bytes)
+                    except Exception as exc:
+                        logger.debug(
+                            "Bytecode cache: failed to unpickle precomputed values for '%s': %s",
+                            name,
+                            exc,
+                        )
+                        _discard_cache_path(path)
+                        return None
+                    if not isinstance(precomputed, list):
+                        _discard_cache_path(path)
+                        return None
+                    offset += pc_len
+
+                (warnings_len,) = struct.unpack_from("<I", data, offset)
+                offset += 4
+                warnings_bytes = data[offset : offset + warnings_len]
+                if warnings_len == 0 or len(warnings_bytes) != warnings_len:
+                    _discard_cache_path(path)
+                    return None
+                compiler_warnings = _deserialize_compiler_warnings(warnings_bytes)
+                offset += warnings_len
+
+                ast = _load_optional_ast(data[offset:], name=name, format_name="v4")
+                if ast is _INCOMPATIBLE_AST:
+                    _discard_cache_path(path)
+                    return None
+
+                return _CachedArtifact(
+                    code=code,
+                    ast=cast("Node | None", ast),
+                    precomputed=precomputed,
+                    compiler_warnings=compiler_warnings,
+                )
+
             if data[: len(_FRAMED_MAGIC_V3)] == _FRAMED_MAGIC_V3:
                 # Framed format (v3): magic(4) + code_len(4) + code
                 #                     + pc_len(4) + pickle(precomputed)
@@ -174,7 +277,7 @@ class BytecodeCache:
                 if len(code_bytes) != code_len:
                     with contextlib.suppress(OSError):
                         path.unlink(missing_ok=True)
-                    return None, None, None
+                    return None
 
                 code = cast("CodeType", marshal.loads(code_bytes))
                 offset += code_len
@@ -186,7 +289,7 @@ class BytecodeCache:
                 if len(data) - offset < 4:
                     with contextlib.suppress(OSError):
                         path.unlink(missing_ok=True)
-                    return None, None, None
+                    return None
 
                 (pc_len,) = struct.unpack_from("<I", data, offset)
                 offset += 4
@@ -196,7 +299,7 @@ class BytecodeCache:
                     if len(pc_bytes) != pc_len:
                         with contextlib.suppress(OSError):
                             path.unlink(missing_ok=True)
-                        return None, None, None
+                        return None
                     try:
                         precomputed = pickle.loads(pc_bytes)
                     except Exception as exc:
@@ -207,7 +310,7 @@ class BytecodeCache:
                         )
                         with contextlib.suppress(OSError):
                             path.unlink(missing_ok=True)
-                        return None, None, None
+                        return None
                     offset += pc_len
 
                 # AST section (optional)
@@ -221,8 +324,13 @@ class BytecodeCache:
                             "Bytecode cache: failed to unpickle AST for '%s': %s", name, exc
                         )
                         ast = None
+                    if ast is not None and not _cached_ast_is_compatible(ast):
+                        logger.debug("Bytecode cache: incompatible cached AST for '%s'", name)
+                        with contextlib.suppress(OSError):
+                            path.unlink(missing_ok=True)
+                        return None
 
-                return code, ast, precomputed
+                return _CachedArtifact(code, ast, precomputed, None)
 
             elif data[: len(_FRAMED_MAGIC)] == _FRAMED_MAGIC:
                 # Framed format (v2): magic(4) + code_len(4 LE) + code + pickle(ast)?
@@ -234,7 +342,7 @@ class BytecodeCache:
                     # Truncated file — discard and signal miss.
                     with contextlib.suppress(OSError):
                         path.unlink(missing_ok=True)
-                    return None, None, None
+                    return None
 
                 code = cast("CodeType", marshal.loads(code_bytes))
 
@@ -252,17 +360,22 @@ class BytecodeCache:
                             "Bytecode cache: failed to unpickle AST (v2) for '%s': %s", name, exc
                         )
                         ast = None
+                    if ast is not None and not _cached_ast_is_compatible(ast):
+                        logger.debug("Bytecode cache: incompatible cached AST (v2) for '%s'", name)
+                        with contextlib.suppress(OSError):
+                            path.unlink(missing_ok=True)
+                        return None
 
-                return code, ast, None
+                return _CachedArtifact(code, ast, None, None)
             else:
                 # Legacy format: plain marshal stream, no AST.
                 code = cast("CodeType", marshal.loads(data))
-                return code, None, None
+                return _CachedArtifact(code, None, None, None)
         except ValueError, EOFError, struct.error:
             # Corrupted or incompatible cache file
             with contextlib.suppress(OSError):
                 path.unlink(missing_ok=True)
-            return None, None, None
+            return None
 
     def set(
         self,
@@ -276,13 +389,9 @@ class BytecodeCache:
     ) -> None:
         """Cache compiled bytecode, optional precomputed constants, and optional AST.
 
-        File format (v3, framed):
-        ``[_FRAMED_MAGIC_V3 (4 B)][code_len (4 B)][marshal(code)]``
-        ``[pc_len (4 B)][pickle(precomputed)?][pickle(ast)?]``
-
-        When ``precomputed`` is ``None`` or empty, ``pc_len`` is 0 and the
-        pickle section is omitted.  Falls back to v2 format when no
-        precomputed values are present.
+        The public method preserves its established signature and stores an
+        empty compiler-warning section. Environment compilation uses the
+        private artifact writer to persist its immutable warning facts.
 
         Args:
             name: Template name
@@ -291,6 +400,28 @@ class BytecodeCache:
             ast: Optimised AST root node (optional).
             precomputed: Non-constant-safe values folded by partial eval.
         """
+        self._set_artifact(
+            name,
+            source_hash,
+            code,
+            context_hash=context_hash,
+            ast=ast,
+            precomputed=precomputed,
+            compiler_warnings=(),
+        )
+
+    def _set_artifact(
+        self,
+        name: str,
+        source_hash: str,
+        code: CodeType,
+        *,
+        context_hash: str | None = None,
+        ast: Node | None = None,
+        precomputed: list | None = None,
+        compiler_warnings: tuple[TemplateWarning, ...],
+    ) -> None:
+        """Atomically store a v4 artifact and its compiler-warning facts."""
         path = self._make_path(name, source_hash, context_hash)
         tmp_path: Path | None = None
 
@@ -305,7 +436,7 @@ class BytecodeCache:
                     "Bytecode cache: failed to pickle precomputed values for '%s': %s", name, exc
                 )
                 pc_bytes = b""
-            use_v3 = bool(pc_bytes)
+            warnings_bytes = _serialize_compiler_warnings(compiler_warnings)
 
             # Write to a unique temp file in the same directory, then atomically
             # replace the target path. Unique temp naming prevents producer races.
@@ -317,18 +448,13 @@ class BytecodeCache:
                 delete=False,
             ) as f:
                 tmp_path = Path(f.name)
-                if use_v3:
-                    # v3 format: includes precomputed section
-                    f.write(_FRAMED_MAGIC_V3)
-                    f.write(struct.pack("<I", len(code_bytes)))
-                    f.write(code_bytes)
-                    f.write(struct.pack("<I", len(pc_bytes)))
-                    f.write(pc_bytes)
-                else:
-                    # v2 format: no precomputed
-                    f.write(_FRAMED_MAGIC)
-                    f.write(struct.pack("<I", len(code_bytes)))
-                    f.write(code_bytes)
+                f.write(_FRAMED_MAGIC_V4)
+                f.write(struct.pack("<I", len(code_bytes)))
+                f.write(code_bytes)
+                f.write(struct.pack("<I", len(pc_bytes)))
+                f.write(pc_bytes)
+                f.write(struct.pack("<I", len(warnings_bytes)))
+                f.write(warnings_bytes)
                 if ast is not None:
                     f.write(pickle.dumps(ast, protocol=5))
 
@@ -355,8 +481,10 @@ class BytecodeCache:
             try:
                 path.unlink(missing_ok=True)
                 count += 1
-            except OSError:
-                pass
+            except OSError as exc:
+                # Cache eviction is best-effort; an inaccessible entry must
+                # not prevent other entries from being cleared.
+                logger.debug("Bytecode cache: could not remove '%s': %s", path, exc)
         return count
 
     def cleanup(self, max_age_days: int = 30) -> int:
@@ -384,9 +512,10 @@ class BytecodeCache:
                 if path.stat().st_mtime < threshold:
                     path.unlink(missing_ok=True)
                     count += 1
-            except OSError:
-                # Skip files that can't be accessed (permissions, etc.)
-                pass
+            except OSError as exc:
+                # Cleanup is best-effort. Preserve the entry and continue so
+                # one permission or race failure cannot block other cleanup.
+                logger.debug("Bytecode cache: could not inspect or remove '%s': %s", path, exc)
 
         return count
 
@@ -405,6 +534,125 @@ class BytecodeCache:
         }
 
 
+def _discard_cache_path(path: Path) -> None:
+    """Best-effort removal for an invalid cache artifact."""
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
+
+
+def _load_optional_ast(
+    data: bytes,
+    *,
+    name: str,
+    format_name: str,
+) -> object:
+    """Load an optional AST, distinguishing incompatible shapes from absence."""
+    if not data:
+        return None
+    try:
+        ast = pickle.loads(data)
+    except Exception as exc:
+        logger.debug(
+            "Bytecode cache: failed to unpickle AST (%s) for '%s': %s",
+            format_name,
+            name,
+            exc,
+        )
+        return None
+    if not _cached_ast_is_compatible(ast):
+        logger.debug("Bytecode cache: incompatible cached AST (%s) for '%s'", format_name, name)
+        return _INCOMPATIBLE_AST
+    return ast
+
+
+def _serialize_compiler_warnings(warnings: tuple[TemplateWarning, ...]) -> bytes:
+    """Serialize immutable warning facts without pickling Python classes."""
+    payload = [
+        {
+            "code": warning.code.value,
+            "line": warning.lineno,
+            "message": warning.message,
+            "suggestion": warning.suggestion,
+            "template": warning.template_name,
+        }
+        for warning in warnings
+    ]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _deserialize_compiler_warnings(data: bytes) -> tuple[TemplateWarning, ...]:
+    """Validate and reconstruct compiler warnings in stored source order."""
+    from kida.exceptions import ErrorCode, TemplateWarning
+
+    payload = json.loads(data.decode("utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("compiler warning metadata must be a list")
+    warnings: list[TemplateWarning] = []
+    expected_keys = {"code", "line", "message", "suggestion", "template"}
+    for item in payload:
+        if not isinstance(item, dict) or set(item) != expected_keys:
+            raise ValueError("compiler warning metadata has an invalid record")
+        code = item["code"]
+        line = item["line"]
+        message = item["message"]
+        suggestion = item["suggestion"]
+        template_name = item["template"]
+        if not isinstance(code, str) or not isinstance(message, str):
+            raise ValueError("compiler warning code and message must be strings")
+        if line is not None and (not isinstance(line, int) or isinstance(line, bool) or line < 1):
+            raise ValueError("compiler warning line must be a positive integer")
+        if suggestion is not None and not isinstance(suggestion, str):
+            raise ValueError("compiler warning suggestion must be a string")
+        if template_name is not None and not isinstance(template_name, str):
+            raise ValueError("compiler warning template must be a string")
+        warnings.append(
+            TemplateWarning(
+                code=ErrorCode(code),
+                message=message,
+                template_name=template_name,
+                lineno=line,
+                suggestion=suggestion,
+            )
+        )
+    return tuple(warnings)
+
+
 def hash_source(source: str) -> str:
     """Generate hash of template source for cache key."""
     return hashlib.sha256(source.encode()).hexdigest()
+
+
+def _cached_ast_is_compatible(ast: object) -> bool:
+    """Return True when an unpickled AST matches the current dataclass shape."""
+    from kida.nodes.base import Node
+
+    if not isinstance(ast, Node):
+        return False
+
+    stack: list[Node] = [ast]
+    while stack:
+        node = stack.pop()
+        for field_name in node.__dataclass_fields__:
+            try:
+                value = getattr(node, field_name)
+            except AttributeError:
+                return False
+            if isinstance(value, Node):
+                stack.append(value)
+            elif isinstance(value, (list, tuple)):
+                _extend_node_sequence(stack, value)
+            elif isinstance(value, dict):
+                _extend_node_sequence(stack, value.values())
+    return True
+
+
+def _extend_node_sequence(stack: list[Node], seq: Iterable[object]) -> None:
+    from kida.nodes.base import Node
+
+    for item in seq:
+        if isinstance(item, Node):
+            stack.append(item)
+        elif isinstance(item, (list, tuple)):
+            _extend_node_sequence(stack, item)
+        elif isinstance(item, dict):
+            _extend_node_sequence(stack, item.values())

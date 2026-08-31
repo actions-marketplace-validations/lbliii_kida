@@ -6,7 +6,10 @@ import ast
 import subprocess
 import tomllib
 from pathlib import Path  # noqa: TC003 — used at runtime
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class ProjectContext(TypedDict):
@@ -119,7 +122,9 @@ def _extract_docstring(path: Path) -> str | None:
         if doc:
             return doc.split("\n")[0].strip().rstrip(".")
     except SyntaxError, UnicodeDecodeError, OSError:
-        pass
+        # Docstrings are optional annotations. Malformed, non-UTF-8, or
+        # unreadable source remains visible in the tree without annotation.
+        return None
     return None
 
 
@@ -261,7 +266,9 @@ def _detect_repo_url(pyproject: dict[str, Any], root: Path) -> str | None:
             url = url.removesuffix(".git")
             return url
     except FileNotFoundError, subprocess.TimeoutExpired:
-        pass
+        # Git is optional for scaffold detection; pyproject metadata remains
+        # authoritative and an unavailable command simply means no fallback.
+        return None
     return None
 
 
@@ -285,11 +292,13 @@ def _detect_author(pyproject: dict[str, Any], root: Path) -> str | None:
         if result.returncode == 0:
             return result.stdout.strip() or None
     except FileNotFoundError, subprocess.TimeoutExpired:
-        pass
+        # Git is optional for scaffold detection. Missing author metadata is
+        # represented by None and normalized by detect_project().
+        return None
     return None
 
 
-def detect_preset(ctx: dict[str, Any]) -> str:
+def detect_preset(ctx: Mapping[str, Any]) -> str:
     """Auto-detect the best README preset based on project metadata.
 
     Priority:
@@ -357,19 +366,19 @@ def detect_project(root: Path, *, depth: int = 2) -> ProjectContext:
     # Runtime dependencies
     dependencies = project.get("dependencies", [])
 
-    base: dict[str, Any] = {
+    base: ProjectContext = {
         "name": project.get("name", root.name),
         "version": project.get("version", ""),
         "description": project.get("description", ""),
         "license": project.get("license", ""),
         "python_requires": project.get("requires-python", ""),
-        "dependencies": dependencies,
+        "dependencies": cast("list[str]", dependencies),
         "has_zero_deps": len(dependencies) == 0,
-        "extras": extras,
+        "extras": cast("dict[str, Any]", extras),
         "dev_dependencies": dev_deps,
         "has_cli": has_cli,
         "cli_name": cli_name,
-        "scripts": scripts,
+        "scripts": cast("dict[str, str]", scripts),
         "tree": tree,
         "tree_str": tree_str,
         "has_tests": (root / "tests").is_dir() or (root / "test").is_dir(),
@@ -378,9 +387,10 @@ def detect_project(root: Path, *, depth: int = 2) -> ProjectContext:
         "test_command": _detect_test_command(root, pyproject),
         "build_tool": build_tool,
         "install_command": install_command,
-        "repo_url": _detect_repo_url(pyproject, root),
-        "author": _detect_author(pyproject, root),
-        "keywords": project.get("keywords", []),
+        "repo_url": _detect_repo_url(pyproject, root) or "",
+        "author": _detect_author(pyproject, root) or "",
+        "keywords": cast("list[str]", project.get("keywords", [])),
+        "suggested_preset": "",
     }
     base["suggested_preset"] = detect_preset(base)
-    return base  # type: ignore[return-value]
+    return base

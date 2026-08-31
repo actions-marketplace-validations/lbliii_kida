@@ -3,7 +3,7 @@
 Provides mixin for parsing template statements (body, data, output, blocks).
 
 Uses inline TYPE_CHECKING declarations for host attributes.
-See: plan/rfc-mixin-protocol-typing.md
+See: docs/design/rfc-mixin-protocol-typing.md
 """
 
 from __future__ import annotations
@@ -298,10 +298,15 @@ class StatementParsingMixin:
         if ext is not None:
             return ext.parse(self, keyword)
 
-        # Unknown keyword
+        # Unknown keyword — include Jinja2 trap hint when applicable
+        from kida.parser.errors import JINJA2_TRAPS
+
+        valid_list = f"Valid keywords: {', '.join(sorted(_VALID_KEYWORDS | ext_tags.keys()))}"
+        trap_hint = JINJA2_TRAPS.get(keyword)
+        suggestion = f"{trap_hint}\n\n{valid_list}" if trap_hint else valid_list
         raise self._error(
             f"Unknown block keyword: {keyword}",
-            suggestion=f"Valid keywords: {', '.join(sorted(_VALID_KEYWORDS | ext_tags.keys()))}",
+            suggestion=suggestion,
         )
 
     def _handle_end_keyword(self, keyword: str) -> None:
@@ -318,9 +323,11 @@ class StatementParsingMixin:
         """
         # End tag without matching opening block
         if not self._block_stack:
+            from kida.parser.errors import BULK_CHECK_TIP
+
             raise self._error(
                 f"Unexpected '{keyword}' - no open block to close",
-                suggestion="Remove this tag or add a matching opening tag",
+                suggestion=f"Remove this tag or add a matching opening tag.\n\n{BULK_CHECK_TIP}",
             )
 
         # Check if end tag matches the innermost block
@@ -335,9 +342,14 @@ class StatementParsingMixin:
             return None
         else:
             # Mismatched end tag
+            from kida.parser.errors import BULK_CHECK_TIP
+
             raise self._error(
                 f"Mismatched closing tag: expected '{{% {expected_end} %}}' or '{{% end %}}', got '{{% {keyword} %}}'",
-                suggestion=f"The innermost open block is '{innermost_block}' (opened at line {self._block_stack[-1][1]})",
+                suggestion=(
+                    f"The innermost open block is '{innermost_block}' "
+                    f"(opened at line {self._block_stack[-1][1]}).\n\n{BULK_CHECK_TIP}"
+                ),
             )
 
     def _skip_comment(self) -> None:

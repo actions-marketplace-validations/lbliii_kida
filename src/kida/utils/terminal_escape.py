@@ -37,6 +37,12 @@ _SGR_RE = re.compile(r"\033\[[\d;]*m")
 # - CSI: ESC [ ... <final byte 0x40-0x7E>
 # - OSC: ESC ] ... (terminated by BEL \007 or ST \033\\)
 # - Two-char: ESC <0x40-0x7E> (e.g., ESC D, ESC M)
+#
+# NOTE: This pattern is intentionally distinct from the one in
+# ``kida.utils.ansi_width``. This one is *strict* (CSI params restricted
+# to ``[0-?]*[ -/]*``) because it gates security sanitization where
+# over-matching would silently consume neighboring text.
+# ``ansi_width._ANSI_RE`` is tolerant by design — see the note there.
 _ANSI_RE = re.compile(
     r"\033"
     r"(?:"
@@ -146,7 +152,7 @@ class Styled(str):
 
     # --- Operations that sanitize non-Styled values ---
 
-    def __add__(self, other: str) -> Self:  # type: ignore[override]
+    def __add__(self, other: str) -> Self:
         """Concatenate, sanitizing ``other`` if not Styled."""
         if isinstance(other, str) and not isinstance(other, Styled):
             other = ansi_sanitize(other)
@@ -158,11 +164,11 @@ class Styled(str):
             other = ansi_sanitize(other)
         return self.__class__(other.__add__(self))
 
-    def __mul__(self, n: SupportsIndex) -> Self:  # type: ignore[override]
+    def __mul__(self, n: SupportsIndex) -> Self:
         """Repeat string n times."""
         return self.__class__(super().__mul__(n))
 
-    def __mod__(self, args: Any) -> Self:  # type: ignore[override]
+    def __mod__(self, args: Any) -> Self:
         """Format string with %-style, sanitizing non-Styled args."""
         escaped_args: Any
         if isinstance(args, tuple):
@@ -181,13 +187,13 @@ class Styled(str):
             return self
         return self.__class__(format(str(self), format_spec))
 
-    def format(self, *args: Any, **kwargs: Any) -> Self:  # type: ignore[override]
+    def format(self, *args: Any, **kwargs: Any) -> Self:
         """Format string, sanitizing non-Styled arguments."""
         args = tuple(_sanitize_arg(a) for a in args)
         kwargs = {k: _sanitize_arg(v) for k, v in kwargs.items()}
         return self.__class__(super().format(*args, **kwargs))
 
-    def join(self, seq: Iterable[str]) -> Self:  # type: ignore[override]
+    def join(self, seq: Iterable[str]) -> Self:
         """Join sequence, sanitizing non-Styled elements."""
         return self.__class__(super().join(_sanitize_arg(s) for s in seq))
 

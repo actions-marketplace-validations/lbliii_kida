@@ -21,12 +21,45 @@ icon: notepad
 
 # Tutorials
 
-Step-by-step guides for common Kida usage scenarios, migration paths, and integration
-workflows.
+Start with the framework you already use, or follow a migration and workflow
+guide below. Every framework quickstart targets Python 3.14+ and reaches a
+typed component plus fragment response in about ten minutes.
 
 :::{cards}
 :columns: 1
 :gap: medium
+
+:::{card} Flask Integration
+:icon: globe
+:link: /docs/tutorials/flask-integration/
+:description: Add a typed component to Flask
+:badge: 10 minutes
+Build a form and a named fragment route through Kida's Flask adapter.
+:::{/card}
+
+:::{card} Django Integration
+:icon: globe
+:link: /docs/tutorials/django-integration/
+:description: Add a typed component to Django
+:badge: 10 minutes
+Configure Kida as a backend, then render a full form and a named fragment.
+:::{/card}
+
+:::{card} FastAPI & Starlette Integration
+:icon: zap
+:link: /docs/tutorials/starlette-integration/
+:description: Add a typed component to FastAPI
+:badge: 10 minutes
+Build a form and fragment endpoint, with Starlette and streaming patterns.
+:::{/card}
+
+:::{card} App-Owned Local Components
+:icon: puzzle
+:link: /docs/tutorials/local-components/
+:description: Compose typed controls and product patterns with ordinary CSS
+Build a server-rendered search surface with scoped slots, static validation,
+accessible state, and no component-library runtime.
+:::{/card}
 
 :::{card} Migrate from Jinja2
 :icon: arrow-right
@@ -36,25 +69,20 @@ workflows.
 Step-by-step migration with before/after examples, API mapping table, and verification steps.
 :::{/card}
 
-:::{card} Flask Integration
-:icon: globe
-:link: /docs/tutorials/flask-integration/
-:description: Use Kida with Flask
-Set up Kida as Flask's template engine with custom filters and error handling.
+:::{card} Upgrade to 0.7
+:icon: arrow-up
+:link: /docs/tutorials/upgrade-to-v0.7/
+:description: Migrate to strict-by-default and null-safe idioms
+:badge: 0.7
+Three fix patterns for the strict_undefined flip, the escape hatch, and the new `?.` / `| get` operators.
 :::{/card}
 
-:::{card} Django Integration
-:icon: globe
-:link: /docs/tutorials/django-integration/
-:description: Use Kida with Django
-Configure Kida as a Django template backend with settings and views.
-:::{/card}
-
-:::{card} Starlette Integration
-:icon: zap
-:link: /docs/tutorials/starlette-integration/
-:description: Use Kida with Starlette and FastAPI
-Async rendering, streaming responses, and HTMX patterns.
+:::{card} Refactor-Safe Templates
+:icon: tree-structure
+:link: /docs/tutorials/refactor-safe-templates/
+:description: Move folders without breaking includes
+:badge: 0.8
+Use `./` / `../` for co-located partials and `@alias/` for shared libraries so folder moves become zero-edit refactors.
 :::{/card}
 
 :::{card} Build Custom Filters

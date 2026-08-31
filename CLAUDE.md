@@ -32,7 +32,8 @@ src/kida/
   analysis/             # Static analysis (dependencies, purity, a11y, coverage)
   sandbox.py            # Sandboxed execution
   formatter.py          # Template source formatter
-  cli.py                # CLI: kida check, kida format
+  cli.py                # Stable CLI entrypoint facade
+  _cli/                 # Lazy command dispatch, parser, and command-owned modules
   markdown/             # Markdown render surface
   terminal/             # Terminal render surface (ANSI colors)
   tstring.py            # T-string / k(t"...") inline templates
@@ -63,10 +64,10 @@ readability in deeply nested templates, but `{% end %}` is the canonical style.
 | Keyword | Scope | Jinja2 equivalent |
 |---------|-------|-------------------|
 | `{% let x = ... %}` | Template-wide — visible everywhere after assignment | `{% set %}` at top level |
-| `{% set x = ... %}` | Block-scoped — does NOT leak out of `{% if %}`, `{% for %}`, etc. | No equivalent (Jinja2 `set` leaks) |
+| `{% set x = ... %}` | Block-scoped — does NOT leak out of `{% if %}`, `{% for %}`, etc. | Jinja2 `set` is loop-local but leaks through `if` branches |
 | `{% export x = ... %}` | Promotes to template (outermost) scope from any nesting depth | `namespace()` pattern |
 
-This is the #1 Jinja2 migration trap: `{% set %}` inside a block does NOT modify outer variables in Kida.
+This is a key Jinja2 migration trap: `{% set %}` inside an `if` modifies an outer variable in Jinja2, but remains block-local in Kida. Assignments inside `for` loops are local in both engines.
 
 ### Inheritance (extends + block)
 
@@ -107,6 +108,10 @@ Key rules:
 - `{% slot name %}...{% end %}` inside `{% call %}` = provides content for a named slot
 - Bare content inside `{% call %}` = provides content for the default slot
 - There is NO `{% fill %}` tag — use `{% slot %}` inside `{% call %}` blocks
+
+For component extraction, pass-through-wrapper, CSS ownership, and
+framework/application boundary decisions, follow the
+[App-Owned Component Authoring Contract](site/content/docs/usage/components.md#app-owned-authoring-contract).
 
 ### Regions (parameterized blocks)
 
@@ -178,10 +183,10 @@ Or use a single-quoted attribute with default `tojson`, or a JSON `<script>` tag
 
 | Jinja2 | Kida | Notes |
 |--------|------|-------|
-| `{% endif %}` | `{% end %}` | Unified block ending |
-| `{% endfor %}` | `{% end %}` | Unified block ending |
-| `{% endblock %}` | `{% end %}` | Unified block ending |
-| `{% macro %}` | `{% def %}` | `{% macro %}` also works but `{% def %}` is preferred |
+| `{% endif %}` | No change required | Accepted matching closer; `{% end %}` is canonical Kida style |
+| `{% endfor %}` | No change required | Accepted matching closer; `{% end %}` is canonical Kida style |
+| `{% endblock %}` | No change required | Accepted matching closer; `{% end %}` is canonical Kida style |
+| `{% macro %}` | `{% def %}` | `{% macro %}` is NOT a valid keyword in Kida — rename to `{% def %}` |
 | `{{ super() }}` | N/A | No super() — use extension blocks |
 | `{% set x = ... %}` | `{% let x = ... %}` | Kida `set` is block-scoped, not template-wide |
 | `namespace(count=0)` | `{% let count = 0 %}` + `{% export %}` | No namespace() in Kida |
@@ -214,7 +219,22 @@ html = template.render_block("content", title="Hello")    # Single block
 html = template.render_with_blocks({"content": inner}, title="Hello")  # Composition
 meta = template.template_metadata()                       # AST introspection
 blocks = template.block_metadata()                        # Block name → metadata
+
+from kida.diagnostics import DiagnosticOptions, apply_safe_edits, diagnose_source
+report = diagnose_source(
+    source,
+    name="page.html",
+    environment=env,
+    options=DiagnosticOptions(validate_calls=True, typed=True),
+)
+updated = apply_safe_edits(source, report.diagnostics, path="page.html")
 ```
+
+Extensions can add static findings to `diagnose_source(..., environment=env)`
+by declaring an uppercase `diagnostic_namespace` and implementing
+`diagnose(context)`. The context is immutable and includes source, AST, and
+visible `DefMetadata`; hooks do not run during rendering or directory/CLI
+diagnosis.
 
 ## Dependencies
 

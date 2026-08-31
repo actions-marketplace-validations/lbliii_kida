@@ -3,13 +3,38 @@
 Tests persistent template caching for fast cold-start.
 """
 
+import logging
+import pickle
+import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
 from kida.bytecode_cache import BytecodeCache, hash_source
 from kida.exceptions import TemplateNotFoundError
+
+
+def _stale_filter_pickle() -> bytes:
+    """Return a Filter pickle from before the parenthesized slot existed."""
+    from kida.nodes import Filter, Name
+
+    current = bytearray(
+        pickle.dumps(
+            Filter(
+                lineno=1,
+                col_offset=3,
+                value=Name(lineno=1, col_offset=3, name="route_link_attrs"),
+                name="html_attrs",
+            ),
+            protocol=5,
+        )
+    )
+    del current[-4]  # Drop NEWFALSE for Filter.parenthesized from the state list.
+    frame_len = struct.unpack("<Q", current[3:11])[0]
+    current[3:11] = struct.pack("<Q", frame_len - 1)
+    return bytes(current)
 
 
 class TestBytecodeCache:
@@ -132,6 +157,31 @@ class TestBytecodeCache:
         # Fake version file should still exist
         assert fake_file.exists()
 
+    def test_clear_skips_and_logs_unremovable_entry(
+        self, cache, cache_dir, caplog, monkeypatch
+    ) -> None:
+        """A permission race does not abort best-effort cache eviction."""
+        blocked = cache_dir / "__kida_py314_blocked_1234567890123456.pyc"
+        blocked.write_bytes(b"blocked")
+        removable = cache_dir / "__kida_py314_removable_1234567890123456.pyc"
+        removable.write_bytes(b"removable")
+        original_unlink = Path.unlink
+
+        def deny_blocked(path: Path, *, missing_ok: bool = False) -> None:
+            if path == blocked:
+                raise PermissionError("unlink denied")
+            original_unlink(path, missing_ok=missing_ok)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "unlink", deny_blocked)
+            with caplog.at_level(logging.DEBUG, logger="kida.bytecode_cache"):
+                assert cache.clear() == 1
+
+        assert blocked.exists()
+        assert not removable.exists()
+        assert "could not remove" in caplog.text
+        assert str(blocked) in caplog.text
+
     def test_stats(self, cache):
         """Stats returns file count and size."""
         code = compile("x = 1", "<test>", "exec")
@@ -186,6 +236,31 @@ class TestBytecodeCache:
 
         # All files should remain
         assert cache.stats()["file_count"] == 2
+
+    def test_cleanup_skips_and_logs_unreadable_entry(
+        self, cache, cache_dir, caplog, monkeypatch
+    ) -> None:
+        """An unreadable cache entry does not stop cleanup of the directory."""
+        blocked = cache_dir / "__kida_py314_blocked_1234567890123456.pyc"
+        blocked.write_bytes(b"blocked")
+        removable = cache_dir / "__kida_py314_removable_1234567890123456.pyc"
+        removable.write_bytes(b"removable")
+        original_stat = Path.stat
+
+        def deny_blocked(path: Path, *args, **kwargs):
+            if path == blocked:
+                raise PermissionError("stat denied")
+            return original_stat(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "stat", deny_blocked)
+            with caplog.at_level(logging.DEBUG, logger="kida.bytecode_cache"):
+                assert cache.cleanup(max_age_days=0) == 1
+
+        assert blocked.exists()
+        assert not removable.exists()
+        assert "could not inspect or remove" in caplog.text
+        assert str(blocked) in caplog.text
 
     def test_cleanup_respects_max_age_days(self, cache, cache_dir):
         """Cleanup respects the max_age_days parameter."""
@@ -254,6 +329,18 @@ class TestBytecodeCache:
 
         # Corrupted file should be removed
         assert not corrupted_path.exists()
+
+    def test_incompatible_cached_ast_is_discarded(self, cache):
+        """Stale pickled AST nodes from an older Kida schema do not crash."""
+        source_hash = hash_source("{{ route_link_attrs(href) | html_attrs }}")
+        code = compile("x = 1", "<test>", "exec")
+        cache.set("stale.html", source_hash, code)
+        path = cache._make_path("stale.html", source_hash)
+        path.write_bytes(path.read_bytes() + _stale_filter_pickle())
+
+        assert cache.stats()["file_count"] == 1
+        assert cache.get("stale.html", source_hash) == (None, None, None)
+        assert cache.stats()["file_count"] == 0
 
 
 class TestHashSource:

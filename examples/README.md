@@ -27,6 +27,10 @@ cd examples/file_loader && python app.py
 
 Kida's `{% def %}` / `{% call %}` / `{% slot %}` pattern for building reusable
 UI components. Supports default and named slots for multi-region composition.
+Use the
+[App-Owned Component Authoring Contract](https://lbliii.github.io/kida/docs/usage/components/#app-owned-authoring-contract)
+to decide which boundaries belong in a component and which route composition
+should remain inline.
 
 ```bash
 cd examples/components && python app.py
@@ -125,14 +129,66 @@ buttons inside cards, cards inside pages.
 cd examples/design_system && python app.py
 ```
 
+### `local_components/` -- App-Owned Components and CSS
+
+A framework-neutral application with typed controls, a product-specific search
+pattern, named and scoped slots, server-rendered accessible state, and ordinary
+app-owned semantic CSS. Includes explicit `kida check` and machine-readable
+component-inspection commands, plus tests for broken props and slot bindings.
+
+```bash
+uv run python examples/local_components/app.py
+```
+
+### `encapsulation_loop/` -- Evidence-Driven Component Refactoring
+
+A deterministic before/after corpus for humans and coding agents. It consumes
+ordinary structured advice, chooses extraction, inlining, or boundary
+preservation, validates calls and slots, compares rendered surfaces, and reports
+false positives, false negatives, and optional local analysis cost.
+
+```bash
+uv run python examples/encapsulation_loop/app.py
+uv run python examples/encapsulation_loop/app.py --measure --rounds 5
+```
+
+### `flask_components/` -- Typed Components in Flask
+
+A real Flask 3.1 app using `kida.contrib.flask`: a typed form component on the
+full-page route and `render_block()` for a POST fragment response. Includes a
+non-network smoke path used by CI.
+
+```bash
+uv run python examples/flask_components/app.py --smoke
+```
+
+### `django_components/` -- Typed Components in Django
+
+A minimal Django 6.0 app registering `kida.contrib.django.KidaTemplates` through
+the standard `TEMPLATES` setting. The GET route uses `django.shortcuts.render`;
+the POST route returns a Kida block fragment.
+
+```bash
+uv run python examples/django_components/app.py --smoke
+```
+
+### `fastapi_components/` -- Typed Components in FastAPI
+
+A FastAPI 0.139 / Starlette 1.3 app using `KidaTemplates.TemplateResponse()` and
+an ASGI-tested POST fragment route, without requiring multipart parsing.
+
+```bash
+uv run python examples/fastapi_components/app.py --smoke
+```
+
 ### `fastapi_async/` -- FastAPI Integration
 
 `render_stream_async()` with FastAPI's `StreamingResponse` for true streaming HTML
-delivery. Templates with `{% async for %}` consume async data sources while the
-response streams to the client.
+delivery on Python 3.14+. Templates with `{% async for %}` consume async data
+sources while the response streams to the client.
 
 ```bash
-pip install fastapi uvicorn
+uv add fastapi uvicorn kida-templates
 cd examples/fastapi_async && uvicorn app:app --reload
 ```
 
@@ -165,6 +221,17 @@ Opt-in metrics for identifying template performance bottlenecks.
 
 ```bash
 cd examples/profiling && python app.py
+```
+
+### `render_capture_manifest/` -- Build-Time Render Facts
+
+`captured_render()` records rendered blocks and selected context into a
+`RenderCapture`. The example accumulates captures in a `RenderManifest`, compares
+two builds, inspects `FreezeCache` candidates and statistics, and derives search
+entries with `SearchManifestBuilder`.
+
+```bash
+cd examples/render_capture_manifest && python app.py
 ```
 
 ### `dict_loader/` -- In-Memory Templates
@@ -209,9 +276,10 @@ cd examples/t_string && python app.py
 
 ### `jinja2_migration/` -- Jinja2 Migration Guide
 
-Side-by-side comparison of equivalent templates. Highlights syntax differences:
-`{% end %}` vs `{% endif %}/{% endfor %}`, `{% match %}` vs `{% if %}/{% elif %}`,
-`??` vs `| default()`, `?.` vs optional chaining patterns.
+Side-by-side comparison of equivalent templates. Shows that matching Jinja
+closers such as `{% endif %}` and `{% endfor %}` are accepted unchanged while
+`{% end %}` remains canonical Kida style, then compares `{% match %}`, `??`, and
+`?.` with their Jinja patterns.
 
 ```bash
 cd examples/jinja2_migration && python app.py
@@ -226,16 +294,65 @@ Use for styling first/last rows, row numbers, and progress indicators.
 cd examples/loop_context && python app.py
 ```
 
+## Additional Examples by Track
+
+These examples are also part of the public catalog and are covered by focused
+tests, smoke tests, or both.
+
+### Component and State Patterns
+
+- `provide_consume/` -- parent-to-child state propagation with `{% provide %}` and `consume()`.
+- `content_stacks/` -- push/stack patterns for head tags, scripts, and deferred content.
+- `list_comprehensions/` -- Python-style list comprehensions in template expressions.
+
+### Agents and CI Reports
+
+- `amp/` -- agent instruction examples for AMP-compatible structured output.
+- `coverage/` -- render coverage data as a report.
+- `review_packet/` -- render tests, lint, coverage, diagnostics, and steward findings as one PR review packet.
+
+### Adoption and Refactor Safety
+
+- `refactor_safety/` -- passing and broken template trees that demonstrate static call validation, parser diagnostics, fragile include linting, and pre-render context checks.
+
+### Extension and Safety Patterns
+
+- `extensions/` -- custom parser/compiler extension hooks.
+- `sandbox/` -- sandboxed rendering policy examples.
+
+### Terminal Rendering
+
+- `terminal_basic/` -- minimal terminal rendering.
+- `terminal_render/` -- render terminal templates from structured data.
+- `terminal_report/` -- terminal report output.
+- `terminal_table/` -- table formatting.
+- `terminal_layout/` -- columns and layout helpers.
+- `terminal_dashboard/` -- dashboard-style terminal output.
+- `terminal_deploy/` -- deployment progress output.
+- `terminal_gitlog/` -- git log formatting.
+- `terminal_monitor/` -- monitoring-style output.
+- `terminal_live/` -- live renderer loop; intentionally excluded from fast smoke tests.
+- `terminal_saga_dashboard/` -- Milo-style saga dashboard with `Store` and `LiveRenderer`.
+
 ## Running Tests
 
-Each example has a `test_<name>.py` that verifies it works end-to-end.
+Example tests are part of Kida's standard pytest collection, so `make test`,
+`make test-cov`, and CI run them alongside `tests/`. Most examples have a local
+`test_<name>.py` that verifies behavior end-to-end. `tests/test_examples.py`
+also smoke-runs practical `run.py` or `app.py` examples and checks that every
+runnable top-level example is listed here.
+
+New examples should keep focused behavior tests beside the example. Use the
+shared `example_app` fixture from `examples/conftest.py` when the test should
+load the sibling `app.py`; guard optional integrations with
+`pytest.importorskip()` so a minimal Kida checkout still collects cleanly.
 
 ```bash
-# All examples
-pytest examples/
+# Standard suite (tests/ and examples/)
+uv run pytest
 
 # One example
-pytest examples/hello/
+uv run pytest examples/hello/
 ```
 
 ## What Each Example Exercises

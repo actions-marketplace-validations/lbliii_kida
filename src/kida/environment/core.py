@@ -23,6 +23,7 @@ Example:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -33,13 +34,14 @@ from kida.environment.filters import DEFAULT_FILTERS
 from kida.environment.registry import FilterRegistry
 from kida.environment.tests import DEFAULT_TESTS
 from kida.exceptions import (
+    TemplateError,
     TemplateNotFoundError,
     TemplateSyntaxError,
 )
 from kida.lexer import Lexer, LexerConfig
 from kida.template import Template
 from kida.utils.lru_cache import LRUCache
-from kida.utils.template_keys import normalize_template_name
+from kida.utils.template_keys import normalize_template_name, resolve_template_name
 
 
 def _identity_gettext(message: str) -> str:
@@ -60,6 +62,64 @@ def _consume_global(key: str, default: Any = None) -> Any:
     if rc is None:
         return default
     return rc.consume(key, default)
+
+
+def _format_call_validation_parts(issue: Any) -> list[str]:
+    """Format the individual problems in a component call validation result."""
+    parts: list[str] = []
+    if issue.unknown_params:
+        parts.append(f"unknown params: {', '.join(issue.unknown_params)}")
+    if issue.missing_required:
+        parts.append(f"missing required: {', '.join(issue.missing_required)}")
+    if issue.duplicate_params:
+        parts.append(f"duplicate params: {', '.join(issue.duplicate_params)}")
+    return parts
+
+
+def _component_call_warning(issue: Any, template_name: str | None) -> Any:
+    """Build a structured warning for a component call validation issue."""
+    from kida.exceptions import ErrorCode, TemplateWarning
+
+    parts = _format_call_validation_parts(issue)
+    return TemplateWarning(
+        code=ErrorCode.COMPONENT_CALL_SIGNATURE,
+        message=f"Call to '{issue.def_name}' has invalid arguments: {'; '.join(parts)}",
+        template_name=template_name,
+        lineno=issue.lineno,
+        suggestion="Check the component's {% def %} signature and rename, add, or remove arguments.",
+    )
+
+
+def _emit_template_warnings(template_warnings: list[Any]) -> None:
+    """Emit structured template warnings through Python's warning surface."""
+    if not template_warnings:
+        return
+    import warnings as warnings_module
+
+    from kida.exceptions import (
+        ComponentWarning,
+        ErrorCode,
+        MigrationWarning,
+        PrecedenceWarning,
+    )
+
+    warning_categories = {
+        ErrorCode.COMPONENT_CALL_SIGNATURE: ComponentWarning,
+        ErrorCode.JINJA2_SET_SCOPING: MigrationWarning,
+    }
+    for template_warning in template_warnings:
+        category = warning_categories.get(template_warning.code, PrecedenceWarning)
+        warnings_module.warn(template_warning.format_message(), category, stacklevel=3)
+
+
+def _iter_nodes(root: Any) -> Any:
+    """Yield AST nodes depth-first without depending on a visitor class."""
+    yield root
+    iter_child_nodes = getattr(root, "iter_child_nodes", None)
+    if iter_child_nodes is None:
+        return
+    for child in iter_child_nodes():
+        yield from _iter_nodes(child)
 
 
 if TYPE_CHECKING:
@@ -87,6 +147,7 @@ if TYPE_CHECKING:
 DEFAULT_TEMPLATE_CACHE_SIZE = 400
 DEFAULT_FRAGMENT_CACHE_SIZE = 1000
 DEFAULT_FRAGMENT_TTL = 300.0  # seconds
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -117,11 +178,12 @@ class Environment:
         globals: Variables available in all templates (includes Python builtins)
 
     Thread-Safety:
-        All operations are safe for concurrent use:
-        - Configuration is immutable after `__post_init__`
-        - `add_filter()`, `add_test()`, `add_global()` use copy-on-write
-        - `get_template()` uses lock-free LRU cache with atomic operations
-        - `render()` uses only local state (StringBuilder pattern)
+        Read and render operations are safe for concurrent use after startup:
+        - Treat public configuration attributes as startup-only state
+        - `add_filter()`, `add_test()`, `add_global()` publish copy-on-write
+          snapshots for readers; applications must serialize competing writers
+        - `get_template()` and related cache state use internal RLocks
+        - `render()` uses per-call local and ContextVar state
 
     Strict Mode:
         Undefined variables raise `UndefinedError` instead of returning empty
@@ -167,9 +229,11 @@ class Environment:
     autoescape: bool | str | Callable[[str | None], bool] = True
     auto_reload: bool = True
     strict_none: bool = False  # When True, sorting with None values raises detailed errors
-    strict_undefined: bool = False  # When True, missing attribute access raises UndefinedError
+    strict_undefined: bool = True  # When True, missing attribute access raises UndefinedError
     jinja2_compat_warnings: bool = (
-        False  # When True, warn on {% set %} inside blocks (Jinja2 scoping difference)
+        True  # Warn when a nested {% set %} shadows an outer {% let %}/{% export %} binding
+        # (the Jinja2 scoping trap). Set False to silence; or filter MigrationWarning
+        # via warnings.filterwarnings.
     )
 
     # Template Introspection (RFC: kida-template-introspection)
@@ -187,6 +251,20 @@ class Environment:
     # - False: Explicitly disabled
     # - BytecodeCache instance: User-provided cache
     bytecode_cache: BytecodeCache | bool | None = None
+
+    # Namespace aliases for template paths (RFC: relative-template-resolution)
+    # Maps alias names to root-relative paths. References like
+    # ``@components/card.html`` resolve to ``{root}/card.html`` before loader
+    # lookup. Aliases resolve BEFORE relative paths — the two modes are
+    # orthogonal (``@components/./foo`` is not supported).
+    #
+    # Example:
+    #   Environment(
+    #       loader=FileSystemLoader("templates/"),
+    #       template_aliases={"components": "ui/components", "layouts": "ui/layouts"},
+    #   )
+    #   env.get_template("@components/card.html")  # → "ui/components/card.html"
+    template_aliases: dict[str, str] | None = None
 
     # Static context for partial evaluation (RFC: partial-evaluation)
     # Values known at compile time.  When set, expressions that depend only
@@ -231,6 +309,15 @@ class Environment:
     # Note: profiled_render() only collects data for templates compiled with
     # enable_profiling=True.
     enable_profiling: bool = False
+
+    # Content capture instrumentation (RFC: render-capture)
+    # When True, compiled templates include capture hooks that record block
+    # content into a RenderCapture when captured_render() is active.
+    # When False (default), all capture AST is stripped at compile time —
+    # zero ContextVar.get() calls, zero None checks per block.
+    # Note: captured_render() only collects data for templates compiled with
+    # enable_capture=True.
+    enable_capture: bool = False
 
     # F-string optimization (RFC: fstring-code-generation)
     # When True, consecutive output nodes are coalesced into single f-string appends
@@ -360,6 +447,12 @@ class Environment:
         # Resolve bytecode cache
         self._bytecode_cache = self._resolve_bytecode_cache()
 
+        # Per-source dedup for the from_string(no-name) bytecode-cache-bypass
+        # warning. Keyed by bytecode_cache.hash_source(source) so the same
+        # source warns once per Environment even if the caller rebuilds the
+        # string each call.
+        self._from_string_warned: set[str] = set()
+
         # Register HTMX helper globals (Feature 1.1)
         if self.enable_htmx_helpers:
             from kida.environment.globals import HTMX_GLOBALS
@@ -408,13 +501,42 @@ class Environment:
     def _init_extensions(self) -> None:
         """Initialize registered extensions."""
 
+        import re
+
+        from kida.exceptions import ErrorCode
+
         tag_map: dict[str, Extension] = {}
         compiler_map: dict[str, Extension] = {}
         end_kw: set[str] = set()
+        diagnostic_namespaces: dict[str, str] = {}
+        reserved_namespaces = {code.value.split("-")[1] for code in ErrorCode}
 
         for ext_cls in self.extensions:
             ext = ext_cls(self)
             self._extension_instances.append(ext)
+
+            namespace = ext.diagnostic_namespace
+            if namespace is not None:
+                if (
+                    not isinstance(namespace, str)
+                    or re.fullmatch(r"[A-Z][A-Z0-9]{1,11}", namespace) is None
+                ):
+                    raise ValueError(
+                        f"Extension {type(ext).__name__} diagnostic_namespace must be "
+                        "2-12 uppercase ASCII letters or digits, starting with a letter"
+                    )
+                if namespace in reserved_namespaces:
+                    raise ValueError(
+                        f"Extension {type(ext).__name__} diagnostic namespace "
+                        f"{namespace!r} is reserved by Kida"
+                    )
+                owner = diagnostic_namespaces.get(namespace)
+                if owner is not None:
+                    raise ValueError(
+                        f"Extension diagnostic namespace {namespace!r} is already owned by "
+                        f"{owner}; {type(ext).__name__} must choose a unique namespace"
+                    )
+                diagnostic_namespaces[namespace] = type(ext).__name__
 
             # Register filters, tests, globals
             for name, func in ext.get_filters().items():
@@ -435,6 +557,58 @@ class Environment:
         self._extension_tags = tag_map
         self._extension_compilers = compiler_map
         self._extension_end_keywords = frozenset(end_kw)
+
+    def _collect_imported_def_metadata(
+        self, ast: TemplateNode, current_name: str | None
+    ) -> dict[str, Any]:
+        """Return visible imported component definitions for static validation.
+
+        Only literal ``{% from "template" import name [as alias] %}`` imports
+        are resolved. Dynamic imports and templates that fail to load are
+        skipped so validation remains conservative.
+        """
+        from kida.nodes import Const, FromImport
+
+        imported: dict[str, Any] = {}
+        for node in _iter_nodes(ast):
+            if not isinstance(node, FromImport):
+                continue
+            if not isinstance(node.template, Const) or not isinstance(node.template.value, str):
+                continue
+            template_name = node.template.value
+            if current_name is not None and template_name == current_name:
+                continue
+            try:
+                template = self.get_template(template_name)
+            except TemplateError as exc:
+                logger.debug(
+                    "Skipping component validation metadata for %s imported by %s: %s",
+                    template_name,
+                    current_name,
+                    exc,
+                )
+                continue
+            meta = template.def_metadata()
+            for original, alias in node.names:
+                def_meta = meta.get(original)
+                if def_meta is not None:
+                    imported[alias or original] = def_meta
+        return imported
+
+    def _collect_component_call_warnings(
+        self,
+        ast: TemplateNode,
+        name: str | None,
+    ) -> list[Any]:
+        """Recompute import-sensitive call diagnostics from the current loader state."""
+        if not self.validate_calls:
+            return []
+        from kida.analysis.analyzer import BlockAnalyzer
+
+        analyzer = BlockAnalyzer()
+        imported_defs = self._collect_imported_def_metadata(ast, name)
+        call_issues = analyzer.validate_calls_with_external_defs(ast, imported_defs)
+        return [_component_call_warning(issue, name or "<string>") for issue in call_issues]
 
     def install_translations(self, translations: Any) -> None:
         """Install a gettext translations object.
@@ -594,17 +768,26 @@ class Environment:
         new_tests.update(tests)
         self._tests = new_tests
 
-    def get_template(self, name: str) -> Template:
+    def get_template(self, name: str, *, caller: str | None = None) -> Template:
         """Load and cache a template by name.
 
         Args:
-            name: Template identifier (e.g., "index.html")
+            name: Template identifier (e.g., ``"index.html"``). May start
+                with ``./`` or ``../`` for resolution relative to the
+                calling template — see ``caller``.
+            caller: Logical name of the template issuing the request.
+                Required when ``name`` is a relative path. Supplied
+                automatically by ``{% include %}``, ``{% extends %}``,
+                ``{% embed %}``, and ``{% from ... import ... %}`` at
+                render time.
 
         Returns:
             Compiled Template object
 
         Raises:
-            TemplateNotFoundError: If template doesn't exist
+            TemplateNotFoundError: If template doesn't exist, the name is
+                relative without a caller, or resolution escapes the
+                template root.
             TemplateSyntaxError: If template has syntax errors
 
         Note:
@@ -622,7 +805,10 @@ class Environment:
                 "Environment(loader=FileSystemLoader('templates/'))",
             )
 
-        name = normalize_template_name(name)
+        if name.startswith("@"):
+            name = self._resolve_alias(name)
+
+        name = resolve_template_name(name, caller=caller)
 
         # Fast path: cache hit when auto_reload=False (avoids _cache_lock overhead)
         if not self.auto_reload:
@@ -678,6 +864,31 @@ class Environment:
 
             return template
 
+    def _resolve_alias(self, name: str) -> str:
+        """Substitute ``@alias/path`` with the configured alias root.
+
+        Raises TemplateNotFoundError when the alias is unknown or when no
+        aliases are configured on this Environment.
+        """
+        rest = name[1:]  # strip leading '@'
+        if "/" in rest:
+            alias_key, alias_path = rest.split("/", 1)
+        else:
+            alias_key, alias_path = rest, ""
+
+        aliases = self.template_aliases or {}
+        if alias_key not in aliases:
+            configured = sorted(f"@{k}/" for k in aliases)
+            hint = (
+                f"Configured aliases: {', '.join(configured)}"
+                if configured
+                else "No template aliases are configured on this Environment."
+            )
+            raise TemplateNotFoundError(f"Unknown template alias '@{alias_key}/'. {hint}")
+
+        root = aliases[alias_key].strip("/")
+        return f"{root}/{alias_path}" if alias_path else root
+
     def from_string(
         self,
         source: str,
@@ -718,6 +929,55 @@ class Environment:
         resolved_static = static_context if static_context is not None else self.static_context
         return self._compile(source, name, None, static_context=resolved_static)
 
+    def _prepare_template_ast(
+        self,
+        source: str,
+        name: str | None,
+        filename: str | None,
+        *,
+        static_context: dict[str, Any] | None,
+        should_escape: bool,
+    ) -> TemplateNode:
+        """Parse and optimize source identically for cold and cache fallback paths."""
+        from kida.parser import Parser
+
+        lexer = Lexer(source, self._lexer_config)
+        tokens = list(lexer.tokenize())
+        parser = Parser(
+            tokens,
+            name,
+            filename,
+            source,
+            autoescape=should_escape,
+            extension_tags=self._extension_tags or None,
+        )
+        ast = parser.parse()
+
+        from kida.compiler.partial_eval import eliminate_dead_code
+
+        ast = eliminate_dead_code(ast)
+        if not static_context:
+            return ast
+
+        from kida.compiler.partial_eval import partial_evaluate
+
+        escape_fn = None
+        if should_escape:
+            from kida.utils.html import Markup
+
+            escape_fn = Markup.escape
+
+        from kida.utils.constants import PURE_FILTERS_ALL
+
+        return partial_evaluate(
+            ast,
+            static_context,
+            escape_func=escape_fn,
+            pure_filters=PURE_FILTERS_ALL | frozenset(self.pure_filters),
+            filter_callables=self._filters,
+            inline_components=self.inline_components,
+        )
+
     def _compile(
         self,
         source: str,
@@ -734,134 +994,83 @@ class Environment:
         When ``static_context`` is provided, runs a partial evaluation pass
         before compilation to replace static expressions with constants.
         """
-        from kida.compiler import Compiler
-        from kida.parser import Parser
-
-        # Check bytecode cache first (for fast cold-start). If static_context
-        # is used for partial evaluation, include a deterministic context hash.
+        # Check bytecode cache first (for fast cold-start). Static context and
+        # warning-affecting compiler configuration participate in the key.
         source_hash = None
-        context_hash = _hash_static_context(static_context)
+        context_hash = _hash_compile_context(
+            static_context,
+            jinja2_compat_warnings=self.jinja2_compat_warnings,
+        )
+        should_escape = self.select_autoescape(name)
         if self._bytecode_cache is not None and name is None:
-            import warnings
+            from kida.bytecode_cache import hash_source
 
-            warnings.warn(
-                "from_string() without name= bypasses bytecode cache. "
-                "Pass name='my_template' to enable caching.",
-                stacklevel=3,
-            )
+            warn_key = hash_source(source)
+            if warn_key not in self._from_string_warned:
+                import warnings
+
+                self._from_string_warned.add(warn_key)
+                warnings.warn(
+                    "from_string() without name= bypasses bytecode cache. "
+                    "Pass name='my_template' to enable caching.",
+                    stacklevel=3,
+                )
         if self._bytecode_cache is not None and name is not None:
             from kida.bytecode_cache import hash_source
 
             source_hash = hash_source(source)
-            cached_code, cached_ast, cached_precomputed = self._bytecode_cache.get(
+            cached_artifact = self._bytecode_cache._get_artifact(
                 name, source_hash, context_hash=context_hash
             )
-            if cached_code is not None:
-                # Resolve AST for introspection when preserve_ast is enabled.
-                # Prefer the cached (pickled) AST to avoid a full re-parse.
-                # Fall back to re-parsing when the cached AST is absent (old
-                # cache entry) or if pickle.loads raised an exception (the
-                # cache's get() already handled that and returned None).
-                optimized_ast = None
-                if self.preserve_ast:
-                    if cached_ast is not None:
-                        optimized_ast = cast("TemplateNode", cached_ast)
-                    else:
-                        lexer = Lexer(source, self._lexer_config)
-                        tokens = list(lexer.tokenize())
-                        should_escape = self.select_autoescape(name)
-                        parser = Parser(
-                            tokens,
-                            name,
-                            filename,
-                            source,
-                            autoescape=should_escape,
-                            extension_tags=self._extension_tags or None,
-                        )
-                        optimized_ast = parser.parse()
-
-                return Template(
+            if cached_artifact is not None and cached_artifact.compiler_warnings is not None:
+                analysis_ast = (
+                    cast("TemplateNode", cached_artifact.ast)
+                    if cached_artifact.ast is not None
+                    else None
+                )
+                if (self.preserve_ast or self.validate_calls) and analysis_ast is None:
+                    analysis_ast = self._prepare_template_ast(
+                        source,
+                        name,
+                        filename,
+                        static_context=static_context,
+                        should_escape=should_escape,
+                    )
+                validation_warnings = (
+                    self._collect_component_call_warnings(analysis_ast, name)
+                    if analysis_ast is not None
+                    else []
+                )
+                template = Template(
                     self,
-                    cached_code,
+                    cached_artifact.code,
                     name,
                     filename,
-                    optimized_ast=optimized_ast,
+                    optimized_ast=analysis_ast if self.preserve_ast else None,
                     source=source,
-                    precomputed=cached_precomputed,
+                    precomputed=cached_artifact.precomputed,
                 )
+                all_warnings = validation_warnings + list(cached_artifact.compiler_warnings)
+                template._compile_warnings = all_warnings
+                _emit_template_warnings(all_warnings)
+                return template
 
-        # Tokenize
-        lexer = Lexer(source, self._lexer_config)
-        tokens = list(lexer.tokenize())
-
-        # Determine autoescape setting for this template
-        # Terminal mode uses its own escape function; the parser just needs a bool
-        should_escape = self.select_autoescape(name)
-
-        # Parse (pass source for rich error messages)
-        parser = Parser(
-            tokens,
+        ast = self._prepare_template_ast(
+            source,
             name,
             filename,
-            source,
-            autoescape=should_escape,
-            extension_tags=self._extension_tags or None,
+            static_context=static_context,
+            should_escape=should_escape,
         )
-        ast = parser.parse()
 
-        # Dead code elimination: remove const-only dead branches (always runs)
-        from kida.compiler.partial_eval import eliminate_dead_code
-
-        ast = eliminate_dead_code(ast)
-
-        # Partial evaluation: replace static expressions with constants
-        if static_context:
-            from kida.compiler.partial_eval import partial_evaluate
-
-            # Provide the escape function so folded Output nodes are
-            # correctly escaped at compile time (prevents XSS from
-            # static_context strings bypassing runtime escaping).
-            escape_fn = None
-            if should_escape:
-                from kida.utils.html import Markup
-
-                escape_fn = Markup.escape
-
-            from kida.utils.constants import PURE_FILTERS_ALL
-
-            ast = partial_evaluate(
-                ast,
-                static_context,
-                escape_func=escape_fn,
-                pure_filters=PURE_FILTERS_ALL | frozenset(self.pure_filters),
-                filter_callables=self._filters,
-                inline_components=self.inline_components,
-            )
-
-        # Call-site validation (RFC: typed-def-parameters)
-        if self.validate_calls:
-            import warnings
-
-            from kida.analysis.analyzer import BlockAnalyzer
-
-            analyzer = BlockAnalyzer()
-            call_issues = analyzer.validate_calls(ast)
-            for issue in call_issues:
-                parts: list[str] = []
-                if issue.unknown_params:
-                    parts.append(f"unknown params: {', '.join(issue.unknown_params)}")
-                if issue.missing_required:
-                    parts.append(f"missing required: {', '.join(issue.missing_required)}")
-                if issue.duplicate_params:
-                    parts.append(f"duplicate params: {', '.join(issue.duplicate_params)}")
-                loc = f"{name or '<string>'}:{issue.lineno}"
-                msg = f"Call to '{issue.def_name}' at {loc} — {'; '.join(parts)}"
-                warnings.warn(msg, stacklevel=2)
+        validation_warnings = self._collect_component_call_warnings(ast, name)
 
         # Preserve AST for introspection if enabled
         optimized_ast = ast if self.preserve_ast else None
 
         # Compile
+        from kida.compiler import Compiler
+
         compiler = Compiler(self)
         code = compiler.compile(ast, name, filename)
         precomputed = compiler.precomputed or None
@@ -874,18 +1083,18 @@ class Environment:
                 seen.add(key)
                 compile_warnings.append(w)
 
-        # Cache bytecode (and AST when available) for future cold-starts.
-        # Serialising the AST avoids re-lexing/re-parsing on cache hits when
-        # preserve_ast=True.  optimized_ast is None when preserve_ast is False,
-        # in which case the cache entry simply contains no AST section.
+        # Cache compiler warnings with bytecode. Call-validation warnings are
+        # intentionally recomputed because imported signatures can change
+        # independently of this template's source hash.
         if self._bytecode_cache is not None and name is not None and source_hash is not None:
-            self._bytecode_cache.set(
+            self._bytecode_cache._set_artifact(
                 name,
                 source_hash,
                 code,
                 context_hash=context_hash,
-                ast=optimized_ast,
+                ast=ast if self.preserve_ast or self.validate_calls else None,
                 precomputed=precomputed,
+                compiler_warnings=tuple(compile_warnings),
             )
 
         tmpl = Template(
@@ -897,20 +1106,10 @@ class Environment:
             source=source,
             precomputed=precomputed,
         )
-        tmpl._compile_warnings = compile_warnings
+        tmpl._compile_warnings = validation_warnings + compile_warnings
 
-        # Emit Python warnings for integration with pytest and logging
-        if compile_warnings:
-            import warnings as _warnings_mod
-
-            from kida.exceptions import ErrorCode, MigrationWarning, PrecedenceWarning
-
-            _warning_categories = {
-                ErrorCode.JINJA2_SET_SCOPING: MigrationWarning,
-            }
-            for w in compile_warnings:
-                category = _warning_categories.get(w.code, PrecedenceWarning)
-                _warnings_mod.warn(w.format_message(), category, stacklevel=2)
+        all_warnings = validation_warnings + compile_warnings
+        _emit_template_warnings(all_warnings)
 
         return tmpl
 
@@ -944,8 +1143,14 @@ class Environment:
                         current_mtime = Path(cached_template._filename).stat().st_mtime_ns
                         if current_mtime == cached_mtime:
                             return False  # mtime unchanged → not stale
-                    except OSError:
-                        pass  # Fall through to hash check
+                    except OSError as exc:
+                        # A stat failure does not prove staleness. Preserve
+                        # correctness by falling through to the source hash.
+                        logger.debug(
+                            "Template mtime unavailable for %s; falling back to source hash: %s",
+                            cached_template._filename,
+                            exc,
+                        )
 
             # Slow path: read source and compare hash
             source, _ = self.loader.get_source(name)
@@ -1214,4 +1419,23 @@ def _hash_static_context(static_context: dict[str, Any] | None) -> str | None:
         )
     except TypeError, ValueError:
         canonical = repr(static_context)
+    return sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _hash_compile_context(
+    static_context: dict[str, Any] | None,
+    *,
+    jinja2_compat_warnings: bool,
+) -> str | None:
+    """Hash code- and compiler-warning-affecting cache configuration."""
+    static_hash = _hash_static_context(static_context)
+    # Preserve the established artifact path for the default configuration so
+    # direct cache consumers can continue to locate Environment-written code.
+    if jinja2_compat_warnings:
+        return static_hash
+    payload = {
+        "jinja2_compat_warnings": False,
+        "static_context": static_hash,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()[:16]

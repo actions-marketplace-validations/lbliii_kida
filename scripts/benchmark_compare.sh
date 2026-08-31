@@ -10,13 +10,12 @@
 #   1 = regressions detected (slower than threshold)
 #   2 = baseline not found
 #
-# This script is designed for CI integration. It runs the render and full
-# comparison benchmark suites, compares against a saved baseline, and fails
-# if any benchmark exceeds the regression threshold.
+# This script is designed for CI integration. It runs the selected benchmark
+# suite, compares against a saved baseline, and fails if any benchmark exceeds
+# the regression threshold.
 #
-# High-variance benchmarks (async, complex inheritance) are excluded from
-# regression checks—CI runners (4 cores) differ from dev machines, causing
-# noisy comparisons. Override with BENCHMARK_INCLUDE_ALL=1 to include them.
+# High-variance benchmarks are excluded from regression checks by default.
+# Override with BENCHMARK_INCLUDE_ALL=1 to include them.
 #
 # Prerequisites:
 #   - A baseline must exist in benchmarks/ (run benchmark_baseline.sh first)
@@ -27,8 +26,29 @@ set -euo pipefail
 BASELINE="${1:-baseline}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BENCHMARK_DIR="$PROJECT_DIR/benchmarks"
-STORAGE="file://$PROJECT_DIR/benchmarks"
+BENCHMARK_DIR="${BENCHMARK_STORAGE_DIR:-$PROJECT_DIR/benchmarks}"
+STORAGE="file://$BENCHMARK_DIR"
+SUITE="${BENCHMARK_SUITE:-core}"
+COMPARE_STAT="${BENCHMARK_COMPARE_STAT:-median}"
+if [ -n "${PYTHON_CMD:-}" ]; then
+    read -r -a PYTHON_RUNNER <<< "$PYTHON_CMD"
+elif command -v uv >/dev/null 2>&1; then
+    PYTHON_RUNNER=(uv run python)
+else
+    PYTHON_RUNNER=(python)
+fi
+
+# shellcheck source=benchmark_suites.sh
+source "$SCRIPT_DIR/benchmark_suites.sh"
+if ! SUITE_DESCRIPTION=$(benchmark_suite_description "$SUITE"); then
+    echo "ERROR: Unknown benchmark suite '$SUITE'"
+    echo "Known suites: $(benchmark_suite_names)"
+    exit 2
+fi
+BENCHMARK_FILES=()
+while IFS= read -r benchmark_file; do
+    BENCHMARK_FILES+=("$benchmark_file")
+done < <(benchmark_files_for_suite "$PROJECT_DIR" "$SUITE")
 
 # Regression threshold: CI uses 20% (shared runners, 4 cores); local uses 15%
 # Override with BENCHMARK_REGRESSION_THRESHOLD=25
@@ -40,37 +60,27 @@ else
     THRESHOLD="15"
 fi
 
-# Exclude jinja2 comparison tests and high-variance benchmarks from regression checks.
-# Jinja2 tests exist for competitive context but shouldn't gate CI — Kida doesn't control
-# Jinja2 performance, and shared runners introduce noise (e.g. test_render_minimal_jinja2
-# showed 42% regression with 39x IQR spike on 2026-03-29, pure CI noise).
-# High-variance kida benchmarks: async (StdDev ~50-100%), include_depth tests (noisy,
-# output_count variant hit 20.4% regression from runner clock speed difference alone),
-# compile_complex (~3ms, fluctuates 30-40% on 4-core runners), compile_small (~2ms, 43% CoV
-# on shared runners — StdDev exceeds mean due to outliers), fragment_cache_cold (cold
-# cache timing varies with runner CPU clock speed), inherited_render_block (~6µs, 12x IQR
-# spike on shared runners), inherited_list_blocks (~µs range, same IQR noise as render_block),
-# bytecode_cache (~µs, 1.2M ops/sec — dominated by CPU clock; 20% regression on 2026-04-13
-# was entirely from runner clock difference: 3.25 GHz baseline vs 2.77 GHz current).
-EXCLUDE_K="not (_jinja2 or test_render_async_medium_kida or test_render_async_large_kida or test_render_complex_kida or test_include_depth_scaling or test_compile_complex_kida or test_compile_small_kida or test_render_fragment_cache_cold_kida or test_benchmark_inherited_render_block or test_benchmark_inherited_list_blocks or test_benchmark_include_depth_output_count_matches_include_count or test_load_from_bytecode_cache_kida)"
+EXCLUDE_K=$(benchmark_exclude_for_suite "$SUITE")
 
 echo "=== Kida Benchmark Regression Check ==="
 echo "Baseline: $BASELINE"
+echo "Suite: $SUITE ($SUITE_DESCRIPTION)"
 echo "Threshold: ${THRESHOLD}% regression"
+echo "Compare stat: $COMPARE_STAT"
 echo "Storage: $STORAGE"
-echo "Python: $(python --version 2>&1)"
+echo "Python: $("${PYTHON_RUNNER[@]}" --version 2>&1)"
 echo "Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-if [ "${BENCHMARK_INCLUDE_ALL:-0}" != "1" ]; then
-    echo "Excluded: all *_jinja2 tests (comparison only), async_medium, async_large, render_complex, compile_complex, compile_small, include_depth_scaling, include_depth_output_count, fragment_cache_cold, inherited_render_block, inherited_list_blocks, bytecode_cache"
+if [ "${BENCHMARK_INCLUDE_ALL:-0}" != "1" ] && [ -n "$EXCLUDE_K" ]; then
+    echo "Filter: $EXCLUDE_K"
 fi
 echo ""
 
 # Check baseline exists for current platform (pytest-benchmark uses platform-specific dirs)
-PLATFORM_DIR=$(python -c "from pytest_benchmark.utils import get_machine_id; print(get_machine_id())")
+PLATFORM_DIR=$("${PYTHON_RUNNER[@]}" -c "from pytest_benchmark.utils import get_machine_id; print(get_machine_id())")
 # find exits 1 when path doesn't exist; avoid triggering set -e so we can handle gracefully
 BASELINE_FILE=""
 if [ -d "$BENCHMARK_DIR/$PLATFORM_DIR" ]; then
-    BASELINE_FILE=$(find "$BENCHMARK_DIR/$PLATFORM_DIR" -name "*_${BASELINE}.json" -not -name "*_comparison*" 2>/dev/null | head -1)
+    BASELINE_FILE=$(find "$BENCHMARK_DIR/$PLATFORM_DIR" -name "*_${BASELINE}.json" -not -name "*_comparison*" 2>/dev/null | sort | tail -1)
 fi
 if [ -z "$BASELINE_FILE" ]; then
     echo "ERROR: Baseline '$BASELINE' not found for platform $PLATFORM_DIR"
@@ -92,31 +102,21 @@ echo ""
 # Run current benchmarks and compare (use --benchmark-compare-fail for hard failure)
 # pytest-benchmark saves as 0001_${name}.json; compare pattern must be *_${name} to match
 # Keep compare settings aligned with benchmark_baseline.sh to avoid artificial drift.
-# Benchmark suite must stay in sync with benchmark_baseline.sh.
 echo "--- Running benchmarks ---"
-BENCHMARK_FILES=(
-    "$PROJECT_DIR/benchmarks/test_benchmark_render.py"
-    "$PROJECT_DIR/benchmarks/test_benchmark_full_comparison.py"
-    "$PROJECT_DIR/benchmarks/test_benchmark_features.py"
-    "$PROJECT_DIR/benchmarks/test_benchmark_introspection.py"
-    "$PROJECT_DIR/benchmarks/test_benchmark_include_depth.py"
-    "$PROJECT_DIR/benchmarks/test_benchmark_inherited_blocks.py"
-    "$PROJECT_DIR/benchmarks/test_benchmark_output_sanity.py"
-)
-if [ "${BENCHMARK_INCLUDE_ALL:-0}" = "1" ]; then
-    python -m pytest "${BENCHMARK_FILES[@]}" \
+if [ "${BENCHMARK_INCLUDE_ALL:-0}" = "1" ] || [ -z "$EXCLUDE_K" ]; then
+    "${PYTHON_RUNNER[@]}" -m pytest "${BENCHMARK_FILES[@]}" \
         --benchmark-only \
         --benchmark-compare="*_${BASELINE}" \
-        --benchmark-compare-fail="mean:${THRESHOLD}%" \
+        --benchmark-compare-fail="${COMPARE_STAT}:${THRESHOLD}%" \
         --benchmark-storage="$STORAGE" \
         --benchmark-min-rounds=10 \
         -q
 else
-    python -m pytest "${BENCHMARK_FILES[@]}" \
+    "${PYTHON_RUNNER[@]}" -m pytest "${BENCHMARK_FILES[@]}" \
         -k "$EXCLUDE_K" \
         --benchmark-only \
         --benchmark-compare="*_${BASELINE}" \
-        --benchmark-compare-fail="mean:${THRESHOLD}%" \
+        --benchmark-compare-fail="${COMPARE_STAT}:${THRESHOLD}%" \
         --benchmark-storage="$STORAGE" \
         --benchmark-min-rounds=10 \
         -q

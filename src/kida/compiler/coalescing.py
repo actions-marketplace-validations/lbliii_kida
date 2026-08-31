@@ -24,7 +24,7 @@ Design:
 - Detect backslashes in expressions (f-strings don't allow them)
 
 Uses inline TYPE_CHECKING declarations for host attributes.
-See: plan/rfc-mixin-protocol-typing.md
+See: docs/design/rfc-mixin-protocol-typing.md
 
 """
 
@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING, Any
 
+from kida.compiler.utils import make_line_marker
 from kida.utils.constants import PURE_FILTERS_COALESCEABLE
 
 if TYPE_CHECKING:
@@ -308,7 +309,16 @@ class FStringCoalescingMixin:
                 i += 1
 
             if len(coalesceable) >= COALESCE_MIN_NODES:
-                # Generate single f-string append
+                # Generate single f-string append, preserving the first risky
+                # output line for UndefinedError/source-snippet attribution.
+                from kida.nodes import Output
+
+                first_output = next(
+                    (node for node in coalesceable if isinstance(node, Output)),
+                    None,
+                )
+                if first_output is not None:
+                    stmts.append(make_line_marker(first_output.lineno))
                 stmts.append(self._compile_coalesced_output(coalesceable))
             elif coalesceable:
                 # Single node - use normal compilation

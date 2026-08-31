@@ -3,7 +3,7 @@
 Provides minimal type contracts for compiler mixins to enable
 type-safe mixin patterns without exposing implementation details.
 
-See: plan/rfc-mixin-protocol-typing.md
+See: docs/design/rfc-mixin-protocol-typing.md
 """
 
 from __future__ import annotations
@@ -49,19 +49,4 @@ class CompilerCoreProtocol(Protocol):
 
     def _compile_node(self, node: Node) -> list[ast.stmt]:
         """Compile a single AST node to Python statements."""
-        ...
-
-    # ─────────────────────────────────────────────────────────────
-    # Operator Utilities (from OperatorUtilsMixin)
-    # ─────────────────────────────────────────────────────────────
-    def _get_binop(self, op: str) -> ast.operator:
-        """Map operator string to AST operator."""
-        ...
-
-    def _get_unaryop(self, op: str) -> ast.unaryop:
-        """Map unary operator string to AST operator."""
-        ...
-
-    def _get_cmpop(self, op: str) -> ast.cmpop:
-        """Map comparison operator string to AST operator."""
         ...

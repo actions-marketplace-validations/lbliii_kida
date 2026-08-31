@@ -109,6 +109,178 @@ True
 
 ## Analysis Concepts
 
+### Shape Profiles
+
+Use the opt-in shape profiler when tooling needs deterministic structural facts
+without asking Kida to decide whether a component should be extracted or
+flattened:
+
+```python
+from kida.analysis import profile_source, profile_template
+
+source_report = profile_source(source, name="components/card.kida")
+compiled_report = profile_template(template)
+
+for profile in source_report.profiles:
+    print(profile.kind, profile.name, profile.span, profile.facts.node_count)
+
+payload = source_report.to_dict()  # JSON-compatible kida.shape-profiles v1
+```
+
+Reports contain one whole-template profile followed by source-ordered profiles
+for `{% def %}`, `{% region %}`, `{% block %}`, and `{% fragment %}` owners.
+Each immutable `ShapeFacts` record keeps node and source volume, depth, branches,
+loops, dynamic expressions and density, component calls, slots, literal HTML
+attributes, repeated AST shapes, conservative context dependencies, and a
+normalized structural fingerprint as separate facts. There is deliberately no
+combined score, severity, suggestion, or automatic edit.
+
+Every profile has an exact `SourceSpan`. `profile_template()` re-analyzes the
+compiled template's retained source, so a fresh compilation and a bytecode-cache
+hit describe the same source shape instead of optimization artifacts. This is
+an opt-in analysis cost and does not change rendering or default compilation.
+
+The shape-profile surface is programmatic only. It does not add a CLI mode,
+directory/multi-root discovery, or a root `kida` export. Callers can serialize
+`report.to_dict()` with the standard `json` module when they need stable
+machine-readable facts.
+
+### Extraction Candidate Advice
+
+Tooling can opt into conservative component-boundary advice for one source or
+compiled template:
+
+```python
+from kida.analysis import advise_extraction_source, advise_extraction_template
+
+source_report = advise_extraction_source(source, name="messages.kida")
+compiled_report = advise_extraction_template(template)
+
+for diagnostic in source_report.diagnostics:
+    print(diagnostic.code, diagnostic.span, dict(diagnostic.metadata))
+```
+
+`K-MOD-102` is an informational, conservative `Diagnostic`. Kida emits it only
+when several independent signals converge: a substantial iterated region or
+normalized repeated siblings, owned interaction/accessibility structure, and a
+small lexical input boundary. A loop, repeated markup, template size, or branch
+count alone is not enough. Existing defs, regions, blocks, and call boundaries
+are not re-recommended.
+
+Each finding has an exact primary span, contributing signals, tentative props,
+possible slots, context and component dependencies, provide/consume
+dependencies, and related locations for repeated siblings. Metadata list values
+are deterministic compact JSON strings. The result deliberately has no combined
+score and no `safe_edit`: component ownership and reuse remain human decisions.
+
+This API is single-source and opt-in. It does not change `DiagnosticOptions`,
+`diagnose_source()`, `kida check`, default compilation, suppression syntax, or
+rendering. Directory and multi-root orchestration belong to a later adapter
+contract.
+
+### Multi-Root Encapsulation Advice
+
+Explicitly owned roots can be analyzed as one deterministic component call
+graph:
+
+```python
+from pathlib import Path
+
+from kida.inspection import TemplateRoot, advise_encapsulation_roots
+
+report = advise_encapsulation_roots(
+    (
+        TemplateRoot("app", Path("templates")),
+        TemplateRoot("adapter", Path("adapter-templates")),
+    )
+)
+```
+
+The report preserves `K-MOD-102` extraction candidates and adds `K-MOD-103`
+for exact pass-through components. Flatten advice requires one same-owner
+caller, one downstream component, an identical typed/defaulted prop interface,
+at most one identically forwarded slot, and no owned markup or behavior. Reuse,
+zero local callers, cross-root callers or downstream components, markup,
+control flow, accessibility structure, context policy, changed defaults,
+renamed/narrowed props, or a different slot surface suppress the finding.
+
+Every flatten finding includes an exact definition span, the only caller and
+downstream definition as related locations, contributing signals, owner/source
+facts, and forwarded props/slots. It is informational and conservative, has no
+safe edit, and explicitly asks the reviewer to preserve documented public,
+product, test, and adapter boundaries.
+
+This programmatic API is opt-in. It does not add a CLI flag or change default
+`kida check` behavior. Root ownership is explicit; Kida does not infer package
+or adapter semantics from ambient imports.
+
+### Adapter Advice Context
+
+Framework adapters can translate their own route, response, or component facts
+into immutable context attached to exact profile spans:
+
+```python
+from kida.analysis import AdviceContext, profile_source
+from kida.inspection import TemplateRoot, advise_encapsulation_roots
+
+profile = profile_source(source, name="app/messages.kida")
+response_block = next(item for item in profile.profiles if item.kind == "block")
+context = AdviceContext(
+    response_block.span,
+    (
+        ("consumer_context", "iterated"),
+        ("preserve_boundary", True),
+        ("response_boundary", True),
+        ("role", "framework-response"),
+    ),
+)
+
+report = advise_encapsulation_roots(roots, context=(context,))
+```
+
+The recognized generic facts are `consumer_context` (`"iterated"` or
+`"repeated"`), boolean `preserve_boundary` and `response_boundary`, descriptive
+`role`, and `visibility` (`"package"` or `"public"`). An iterated response block
+stays intact while nested extraction candidates can become visible. Visibility
+and preservation facts suppress flatten advice only for an exact definition
+span.
+
+Unknown facts and values are ignored; a context containing only unknown facts
+produces the same report as no adapter context. Kida does not interpret
+framework modifier names or import framework packages. Facts are sorted,
+invocation-local, and represented in ordinary diagnostic metadata, so no new
+schema or shared registry is introduced. See the
+[adapter advice-context contract](https://github.com/lbliii/kida/blob/main/docs/audit/adapter-advice-context-contract.md)
+for the complete matching and compatibility rules.
+
+### Evidence-Driven Encapsulation Loop
+
+Humans and coding agents can use the same supported loop without a specialized
+Kida orchestration layer:
+
+1. Run `advise_encapsulation_roots()` and consume each finding's code, exact
+   span, confidence, metadata, and related locations.
+2. Choose extraction, pass-through inlining, or intentional preservation from
+   that evidence; Kida does not make the ownership decision.
+3. Run `diagnose_roots(..., options=DiagnosticOptions(validate_calls=True))` to
+   validate the resulting props and slots.
+4. Render the same context before and after, including named response blocks.
+5. Re-run advice and record remaining findings, false positives, false
+   negatives, context effects, and analysis cost.
+
+The runnable
+[`examples/encapsulation_loop`](https://github.com/lbliii/kida/tree/main/examples/encapsulation_loop)
+commits five before/after cases and deterministic calibration JSON: a growing
+route, a healthy large layout, a pass-through micro-component, an
+adapter-preserved response boundary, and multiple explicit roots. The replay
+proves render and call-validation parity while leaving ambiguous edits to the
+consumer. Optional `--measure` output stays outside the stable snapshot.
+
+```bash
+uv run python examples/encapsulation_loop/app.py
+uv run python examples/encapsulation_loop/app.py --measure --rounds 5
+```
+
 ### Dependencies
 
 The dependency walker extracts every context variable path a template accesses.
@@ -180,6 +352,96 @@ top-level variable names against the provided context keys plus environment
 globals. It returns a sorted list of missing names, or an empty list if
 everything is present.
 
+### Dotted Context Contracts
+
+Frameworks that know more than top-level keys can compare a route or handler
+contract against Kida's dotted dependency paths:
+
+```python
+from kida.analysis import check_context_contract
+
+issues = check_context_contract(
+    template,
+    provided={"page.title", "page.author.name"},
+    globals={"csrf_token"},
+    optional={"flash.message"},
+)
+
+for issue in issues:
+    print(issue.code, issue.path, issue.message)
+```
+
+`provided`, `globals`, and `optional` can be dotted-path iterables or nested
+mappings. This checker is deliberately route-agnostic: frameworks supply the
+contract shape, and Kida reports only whether template dependency paths are
+covered. Enable `check_extra=True` when a narrow contract should also warn about
+provided paths the template does not read.
+
+`K-CTX-001` and `K-CTX-002` are registered in the public `ErrorCode` enum;
+`ContextContractIssue.code` remains the same string-valued field for backward
+compatibility.
+
+## Literal Attribute Extraction
+
+Framework adapters and CI reports can inspect literal HTML attributes without
+parsing Kida's AST themselves:
+
+```python
+from kida.analysis import extract_literal_attributes
+
+attrs = extract_literal_attributes(
+    template,
+    prefixes=("data-", "hx-"),
+)
+
+for attr in attrs:
+    print(attr.tag, attr.name, attr.value, attr.lineno)
+```
+
+This reports only attributes visible in static template text. Dynamic attributes
+such as `{{ attrs }}`, `xmlattr`, or helper-generated markup are intentionally
+not inferred. Kida provides the generic facts; frameworks decide whether a
+literal `data-*`, `hx-*`, `id`, or other attribute has route-specific meaning.
+
+## Escape Audit
+
+Use `audit_escaping()` to inventory where a template outputs escaped values,
+where autoescape is disabled, and where filters intentionally produce trusted
+markup:
+
+```python
+from kida.analysis import audit_escaping
+
+for finding in audit_escaping(template):
+    print(finding.code, finding.kind, finding.expression, finding.message)
+```
+
+Findings are static diagnostics only. They do not change rendering and do not
+prove user input was sanitized. `| safe` findings include the optional
+`reason=` text when present; missing reasons get a suggestion so code review and
+CI reports can point at explicit trust boundaries. Codes `K-ESC-001` through
+`K-ESC-005` are registered in the public `ErrorCode` enum without changing the
+existing string-valued `EscapeAuditFinding.code` field.
+
+## Privacy Lint
+
+Use `lint_privacy()` to catch likely private data exposure before templates or
+report fixtures are published:
+
+```python
+from kida.analysis import lint_privacy
+
+for finding in lint_privacy(template):
+    print(finding.code, finding.kind, finding.path, finding.message)
+```
+
+The first version is intentionally narrow. It reports sensitive-looking context
+paths, secret-like string literals without echoing their values, `| safe` on
+sensitive-looking values, broad debug context output, and dynamic template names
+that a framework policy cannot statically allowlist. Codes `K-PRI-001` through
+`K-PRI-005` are registered in the public `ErrorCode` enum; findings retain their
+existing string-valued `code` field.
+
 ## Call-Site Validation
 
 Kida can validate `{% def %}` call sites at compile time, catching parameter errors
@@ -241,7 +503,7 @@ for issue in issues:
 | `col_offset` | `int` | Column offset of the call site |
 | `unknown_params` | `tuple[str, ...]` | Keyword args not in the definition |
 | `missing_required` | `tuple[str, ...]` | Required params not provided |
-| `duplicate_params` | `tuple[str, ...]` | Params passed more than once |
+| `duplicate_params` | `tuple[str, ...]` | Params passed more than once; parser-produced ASTs reject these before validation |
 
 | Property | Description |
 |----------|-------------|
@@ -274,7 +536,7 @@ analyzer = BlockAnalyzer(config=config)
 Kida ships with a default config (`DEFAULT_CONFIG`) that includes common SSG
 pure functions like `asset_url`, `t`, `canonical_url`, etc.
 
-## Case Study: Bengal Static Site Generator
+## Historical Case Study: Bengal Static Site Generator
 
 [Bengal](https://github.com/bengal-ssg/bengal) uses Kida's analysis API to
 implement smart incremental builds:
@@ -358,6 +620,10 @@ See [Framework Integration](/docs/usage/framework-integration/) for the full ada
 | `required_context()` | `() -> frozenset[str]` | Top-level variable names needed |
 | `depends_on()` | `() -> frozenset[str]` | All dotted dependency paths |
 | `validate_context()` | `(context: dict) -> list[str]` | Missing variable names |
+| `check_context_contract()` | `(template, provided, ...) -> list[ContextContractIssue]` | Dotted context contract diagnostics |
+| `extract_literal_attributes()` | `(template_or_ast, names=..., prefixes=...) -> list[LiteralAttribute]` | Literal HTML attributes with source locations |
+| `audit_escaping()` | `(template_or_ast, include_output_sites=True) -> list[EscapeAuditFinding]` | Static escape and trusted-markup findings |
+| `lint_privacy()` | `(template_or_ast) -> list[PrivacyFinding]` | Sensitive path, secret literal, and broad-output findings |
 | `block_metadata()` | `() -> dict[str, BlockMetadata]` | Per-block analysis results |
 | `template_metadata()` | `() -> TemplateMetadata \| None` | Full template analysis |
 | `is_cacheable()` | `(block_name: str \| None) -> bool` | Cache safety check |
@@ -368,6 +634,7 @@ See [Framework Integration](/docs/usage/framework-integration/) for the full ada
 | Field | Type | Description |
 |---|---|---|
 | `name` | `str` | Block identifier |
+| `modifiers` | `tuple[BlockModifierMetadata, ...]` | Ordered literal framework metadata with source locations |
 | `depends_on` | `frozenset[str]` | Context paths accessed |
 | `is_pure` | `"pure" \| "impure" \| "unknown"` | Determinism classification |
 | `cache_scope` | `"site" \| "page" \| "none" \| "unknown"` | Recommended cache level |
@@ -376,6 +643,11 @@ See [Framework Integration](/docs/usage/framework-integration/) for the full ada
 | `inferred_role` | `str` | Heuristic role classification |
 | `is_region` | `bool` | True if block is a `{% region %}` |
 | `region_params` | `tuple[str, ...]` | Parameter names (regions only) |
+
+`BlockMetadata.get_modifier(name)` returns the matching immutable
+`BlockModifierMetadata` or `None`. Each modifier exposes `name`, its typed
+scalar `value`, and the one-based `lineno` / zero-based `col_offset` where its
+name begins.
 
 ### TemplateMetadata
 

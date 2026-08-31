@@ -12,6 +12,17 @@ from typing import Literal, final
 
 @final
 @dataclass(frozen=True, slots=True)
+class BlockModifierMetadata:
+    """One literal block modifier with its declaration location."""
+
+    name: str
+    value: str | int | float | bool | None
+    lineno: int
+    col_offset: int
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class BlockMetadata:
     """Metadata about a template block, inferred from static analysis.
 
@@ -57,6 +68,7 @@ class BlockMetadata:
     """
 
     name: str
+    modifiers: tuple[BlockModifierMetadata, ...] = ()
 
     # Output characteristics
     emits_html: bool = True
@@ -83,6 +95,10 @@ class BlockMetadata:
     # Region-specific (RFC: kida-regions)
     is_region: bool = False
     region_params: tuple[str, ...] = ()
+
+    def get_modifier(self, name: str) -> BlockModifierMetadata | None:
+        """Return a declared modifier by name, or ``None`` when absent."""
+        return next((modifier for modifier in self.modifiers if modifier.name == name), None)
 
     def is_cacheable(self) -> bool:
         """Check if this block can be safely cached.
@@ -208,7 +224,9 @@ class CallValidation:
         col_offset: Source column of the call site.
         unknown_params: Keyword argument names not in the definition's parameters.
         missing_required: Required parameters (no default) not provided by the call.
-        duplicate_params: Keyword argument names supplied more than once.
+        duplicate_params: Keyword argument names supplied more than once. Parser-produced
+            ASTs reject duplicate keyword arguments before validation; this field remains
+            for callers validating externally constructed ASTs.
 
     """
 
@@ -292,6 +310,8 @@ class DefMetadata:
         slots: Named slots referenced in the def body (excludes ``"default"``).
         has_default_slot: True if the body contains an unnamed ``{% slot %}``.
         depends_on: Context paths the def body may access (conservative superset).
+        vararg: Name of the ``*args`` parameter, if declared.
+        kwarg: Name of the ``**kwargs`` parameter, if declared.
 
     Example:
             >>> meta = template.def_metadata()
@@ -308,6 +328,8 @@ class DefMetadata:
     slots: tuple[str, ...] = ()
     has_default_slot: bool = False
     depends_on: frozenset[str] = frozenset()
+    vararg: str | None = None
+    kwarg: str | None = None
 
 
 @final

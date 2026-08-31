@@ -63,7 +63,11 @@ from kida import Markup  # Built-in, not markupsafe
 
 ### Why unified `{% end %}`?
 
-Unified endings are:
+Unified `{% end %}` is Kida's canonical style. Matching explicit closers such as
+`{% endif %}`, `{% endfor %}`, and `{% endblock %}` remain valid, so migration
+does not require closer-only edits.
+
+The canonical unified form is:
 
 - **Simpler**: One syntax to remember
 - **Cleaner**: Less visual noise
@@ -152,11 +156,11 @@ See [[docs/about/performance|Performance]].
 
 ### Is Kida thread-safe?
 
-Yes. All public APIs are thread-safe:
+Yes for rendering and template lookup APIs:
 
 - Configuration is immutable after creation
 - Rendering uses only local variables (no shared mutable state)
-- Filter/test additions use copy-on-write (no locks)
+- Add filters, tests, and globals during startup before concurrent rendering
 - Caches use atomic operations
 
 ### What's free-threading support?

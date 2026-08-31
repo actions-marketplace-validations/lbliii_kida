@@ -3,7 +3,7 @@
 import pytest
 
 from kida.environment.exceptions import TemplateNotFoundError
-from kida.utils.template_keys import normalize_template_name
+from kida.utils.template_keys import normalize_template_name, resolve_template_name
 
 
 def test_normalize_template_name_strips_whitespace() -> None:
@@ -36,6 +36,69 @@ def test_normalize_template_name_allows_valid_paths() -> None:
     assert normalize_template_name("partials/_header.html") == "partials/_header.html"
 
 
+def test_resolve_template_name_absolute_matches_normalize() -> None:
+    """Non-relative names resolve identically to normalize_template_name."""
+    assert resolve_template_name("page.html") == "page.html"
+    assert resolve_template_name("layouts/base.html", caller="anything") == "layouts/base.html"
+    assert resolve_template_name("  page.html  ") == "page.html"
+
+
+def test_resolve_template_name_dot_relative() -> None:
+    """`./x` resolves against caller's directory."""
+    assert resolve_template_name("./card.html", caller="pages/about.html") == "pages/card.html"
+    assert resolve_template_name("./x.html", caller="a/b/c.html") == "a/b/x.html"
+    # Caller at root
+    assert resolve_template_name("./x.html", caller="index.html") == "x.html"
+
+
+def test_resolve_template_name_dotdot_relative() -> None:
+    """`../x` walks up one directory from caller."""
+    assert (
+        resolve_template_name("../shared/nav.html", caller="pages/blog/post.html")
+        == "pages/shared/nav.html"
+    )
+    assert resolve_template_name("../x.html", caller="a/b.html") == "x.html"
+
+
+def test_resolve_template_name_nested_relative() -> None:
+    """Deep `../../x` resolves correctly."""
+    assert resolve_template_name("../../shared.html", caller="a/b/c/d.html") == "a/shared.html"
+
+
+def test_resolve_template_name_rejects_escape() -> None:
+    """Resolution that walks above the template root is rejected."""
+    with pytest.raises(TemplateNotFoundError) as exc_info:
+        resolve_template_name("../../../etc/passwd", caller="pages/about.html")
+    assert "escapes" in str(exc_info.value).lower()
+
+
+def test_resolve_template_name_requires_caller() -> None:
+    """Relative paths without a caller raise a clear error."""
+    with pytest.raises(TemplateNotFoundError) as exc_info:
+        resolve_template_name("./card.html")
+    assert "caller" in str(exc_info.value).lower()
+
+    with pytest.raises(TemplateNotFoundError):
+        resolve_template_name("../x.html", caller=None)
+
+    with pytest.raises(TemplateNotFoundError):
+        resolve_template_name("./x.html", caller="")
+
+
+def test_resolve_template_name_normalizes_interior_dotdot_resolved_inside_root() -> None:
+    """Interior `..` inside a relative path resolves to a valid within-root name."""
+    # pages/./foo/../card.html → pages/card.html
+    assert (
+        resolve_template_name("./foo/../card.html", caller="pages/about.html") == "pages/card.html"
+    )
+
+
+def test_resolve_template_name_rejects_bare_dot_at_root() -> None:
+    """`./` from a root-level caller resolves to '.' and is rejected."""
+    with pytest.raises(TemplateNotFoundError):
+        resolve_template_name("./", caller="index.html")
+
+
 def test_filesystem_loader_rejects_path_traversal() -> None:
     """FileSystemLoader rejects path traversal when used directly."""
     import tempfile
@@ -64,93 +127,3 @@ def test_package_loader_rejects_path_traversal() -> None:
         loader.get_source("../../etc/passwd")
     with pytest.raises(TemplateNotFoundError):
         loader.get_source("layouts/../secret.html")
-
-
-def test_invalid_block_name_raises() -> None:
-    """Invalid block names raise TemplateSyntaxError at compile time."""
-    from kida import DictLoader, Environment
-    from kida.compiler import Compiler
-    from kida.environment.exceptions import TemplateSyntaxError
-    from kida.nodes import Block, Data
-    from kida.nodes.structure import Template
-
-    # Parser only accepts identifier-like names, so we test the compiler directly
-    # with a Block node that has an invalid name (e.g. from programmatic construction)
-    bad_block = Block(
-        lineno=1,
-        col_offset=0,
-        name="invalid-name",
-        body=(Data(lineno=2, col_offset=0, value="x"),),
-    )
-    root = Template(
-        lineno=1,
-        col_offset=0,
-        body=(bad_block,),
-        extends=None,
-        context_type=None,
-    )
-    env = Environment(loader=DictLoader({}))
-    compiler = Compiler(env)
-    with pytest.raises(TemplateSyntaxError) as exc_info:
-        compiler.compile(root, name="test.html")
-    assert "Invalid block name" in str(exc_info.value)
-    assert "invalid-name" in str(exc_info.value)
-
-
-def test_invalid_def_name_raises() -> None:
-    """Invalid def names raise TemplateSyntaxError at compile time."""
-    from kida import DictLoader, Environment
-    from kida.compiler import Compiler
-    from kida.environment.exceptions import TemplateSyntaxError
-    from kida.nodes import Data, Def
-    from kida.nodes.structure import Template
-
-    bad_def = Def(
-        lineno=1,
-        col_offset=0,
-        name="invalid-def",
-        params=(),
-        body=(Data(lineno=2, col_offset=0, value="x"),),
-    )
-    root = Template(
-        lineno=1,
-        col_offset=0,
-        body=(bad_def,),
-        extends=None,
-        context_type=None,
-    )
-    env = Environment(loader=DictLoader({}))
-    compiler = Compiler(env)
-    with pytest.raises(TemplateSyntaxError) as exc_info:
-        compiler.compile(root, name="test.html")
-    assert "Invalid def name" in str(exc_info.value)
-    assert "invalid-def" in str(exc_info.value)
-
-
-def test_invalid_slot_name_raises() -> None:
-    """Invalid slot names raise TemplateSyntaxError at compile time."""
-    from kida import DictLoader, Environment
-    from kida.compiler import Compiler
-    from kida.environment.exceptions import TemplateSyntaxError
-    from kida.nodes import Data, SlotBlock
-    from kida.nodes.structure import Template
-
-    bad_slot = SlotBlock(
-        lineno=1,
-        col_offset=0,
-        name="bad-slot",
-        body=(Data(lineno=2, col_offset=0, value="x"),),
-    )
-    root = Template(
-        lineno=1,
-        col_offset=0,
-        body=(bad_slot,),
-        extends=None,
-        context_type=None,
-    )
-    env = Environment(loader=DictLoader({}))
-    compiler = Compiler(env)
-    with pytest.raises(TemplateSyntaxError) as exc_info:
-        compiler.compile(root, name="test.html")
-    assert "Invalid slot name" in str(exc_info.value)
-    assert "bad-slot" in str(exc_info.value)

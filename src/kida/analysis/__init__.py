@@ -28,21 +28,30 @@ Example:
     ...     print(f"Nav can be cached site-wide, depends on: {nav.depends_on}")
 
 Thread-Safety:
-All analysis classes are stateless or use immutable results.
-Safe for concurrent use across threads.
+``BlockAnalyzer``, ``DependencyWalker``, ``PurityAnalyzer``, and
+``LandmarkDetector`` are safe to share across concurrent analysis calls.
+Traversal state is local to each call. Frozen metadata records are safe for
+concurrent read access; mapping-valued fields remain caller-visible and must
+not be mutated while shared.
 
 """
 
 from __future__ import annotations
 
+from kida.analysis.advice_context import AdviceContext, AdviceFactValue
 from kida.analysis.analyzer import BlockAnalyzer
+from kida.analysis.attributes import LiteralAttribute, extract_literal_attributes
 from kida.analysis.cache import infer_cache_scope
 from kida.analysis.config import DEFAULT_CONFIG, AnalysisConfig
+from kida.analysis.context_contracts import ContextContractIssue, check_context_contract
 from kida.analysis.dependencies import DependencyWalker
+from kida.analysis.escape_audit import EscapeAuditFinding, audit_escaping
+from kida.analysis.extraction_advice import advise_extraction_source, advise_extraction_template
 from kida.analysis.i18n import ExtractedMessage, ExtractMessagesVisitor
 from kida.analysis.landmarks import LandmarkDetector
 from kida.analysis.metadata import (
     BlockMetadata,
+    BlockModifierMetadata,
     CallValidation,
     DefMetadata,
     DefParamInfo,
@@ -50,25 +59,53 @@ from kida.analysis.metadata import (
     TemplateStructureManifest,
     TypeMismatch,
 )
+from kida.analysis.privacy import PrivacyFinding, lint_privacy
 from kida.analysis.purity import PurityAnalyzer
 from kida.analysis.roles import classify_role
+from kida.analysis.shape_profiles import (
+    ShapeFacts,
+    ShapeProfile,
+    ShapeProfileKind,
+    ShapeProfileReport,
+    profile_source,
+    profile_template,
+)
 
 __all__ = [
     "DEFAULT_CONFIG",
+    "AdviceContext",
+    "AdviceFactValue",
     "AnalysisConfig",
     "BlockAnalyzer",
     "BlockMetadata",
+    "BlockModifierMetadata",
     "CallValidation",
+    "ContextContractIssue",
     "DefMetadata",
     "DefParamInfo",
     "DependencyWalker",
+    "EscapeAuditFinding",
     "ExtractMessagesVisitor",
     "ExtractedMessage",
     "LandmarkDetector",
+    "LiteralAttribute",
+    "PrivacyFinding",
     "PurityAnalyzer",
+    "ShapeFacts",
+    "ShapeProfile",
+    "ShapeProfileKind",
+    "ShapeProfileReport",
     "TemplateMetadata",
     "TemplateStructureManifest",
     "TypeMismatch",
+    "advise_extraction_source",
+    "advise_extraction_template",
+    "audit_escaping",
+    "check_context_contract",
     "classify_role",
+    "extract_literal_attributes",
     "infer_cache_scope",
+    "lint_privacy",
+    "profile_source",
+    "profile_template",
 ]

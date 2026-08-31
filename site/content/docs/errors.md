@@ -20,7 +20,11 @@ icon: alert-triangle
 
 # Error Codes
 
-Every Kida exception carries an `ErrorCode` that categorizes the error and links to this page. Use `exc.code.value` to get the code string (e.g. `"K-RUN-001"`). For full error handling guidance, see [[docs/usage/error-handling|Error Handling]].
+Kida exceptions and static-analysis findings use the public `ErrorCode` registry
+to categorize diagnostics and link to this page. Exception codes are enum
+members (`exc.code.value`); analysis records expose the corresponding stable
+string through `finding.code`. For full error handling guidance, see
+[[docs/usage/error-handling|Error Handling]].
 
 ## Lexer Errors (K-LEX-xxx)
 
@@ -60,11 +64,29 @@ Parser errors occur when building the template AST from tokens.
 
 Fix: Check syntax around the reported line. Common causes: misplaced `{% end %}`, invalid tag name, or malformed expression.
 
+#### Coming from Jinja2?
+
+When you type a Jinja2-ism that Kida does not accept, the parser error suggestion points at the Kida equivalent. Common traps:
+
+Matching explicit closers such as `{% endif %}`, `{% endfor %}`, and
+`{% endblock %}` are accepted and do not trigger these migration errors.
+
+| Jinja2 | Kida | Hint surfaced by parser |
+|--------|------|------------------------|
+| `{% macro name(...) %}` | `{% def name(...) %}` | "Kida uses `{% def %}` for macros" |
+| `{% endmacro %}` | `{% end %}` | "Kida uses unified `{% end %}` for all blocks" |
+| `{% namespace ns %}` / `namespace(count=0)` | `{% let %}` + `{% export %}` | "Kida has no `namespace()` — use `{% let %}` / `{% export %}`" |
+| `{% fill name %}` | `{% slot name %}` inside `{% call %}` | "Kida has no `{% fill %}` tag" |
+| `{% set x %}...{% endset %}` | `{% capture x %}...{% end %}` | "Kida uses unified `{% end %}` for block-capture" |
+
+See [Migrating from Jinja2]({{< ref "docs/tutorials/migrate-from-jinja2" >}}) for the complete translation table.
+
 ### k-par-002
 
-**Unclosed block** — A block tag (e.g. `{% if %}`, `{% for %}`) was not closed with `{% end %}`.
+**Unclosed block** — A block tag (e.g. `{% if %}`, `{% for %}`) was not closed.
 
-Fix: Add `{% end %}` for every opening block tag.
+Fix: Add canonical `{% end %}` or the matching explicit closer, such as
+`{% endif %}` or `{% endfor %}`, for every opening block tag.
 
 ### k-par-003
 
@@ -224,6 +246,26 @@ Fix: Fix the syntax error at the reported line. See parser and lexer errors abov
 
 Fix: Restructure template inheritance to eliminate the cycle. Use a shared base template or `{% include %}` instead of circular `{% extends %}`.
 
+### k-tpl-004
+
+**Definition not top-level** — A `{% def %}` or `{% region %}` was declared
+inside another block, loop, conditional, component, or region.
+
+Fix: Move `{% def %}` and `{% region %}` declarations to the template top
+level. Top-level declarations are visible to render, block render, component
+metadata, and static validation. Nested defs are not render-block targets and
+cannot be validated reliably.
+
+### k-tpl-005
+
+**Invalid template-root configuration** — Explicit multi-root inspection found
+a missing directory, duplicate namespace, or duplicate logical template
+identifier.
+
+Fix: Give every `--root` a unique namespace, verify each directory exists, and
+ensure every template has one unambiguous `namespace/relative/path` identifier.
+Inspection never applies unprefixed first-loader-wins behavior.
+
 ## Security Errors (K-SEC-xxx)
 
 Security errors occur in sandboxed environments when a template tries to access restricted resources.
@@ -258,6 +300,191 @@ Fix: Check the `SandboxPolicy.allow_calling` configuration. If calling is requir
 
 Fix: Reduce template output size or increase `SandboxPolicy.max_output_size`. Consider paginating large datasets.
 
+## Component Validation (K-CMP-xxx)
+
+Component validation diagnostics are emitted by `Environment(validate_calls=True)`
+and `kida check --validate-calls`. They are compile-time diagnostics for
+`{% def %}` call sites, including calls to literal `{% from "..." import ... %}`
+component imports. Dynamic imports are skipped because Kida cannot know the
+target template at check time.
+
+### k-cmp-001
+
+**Component call signature mismatch** — A component call used unknown keyword
+arguments, omitted required parameters, or supplied duplicate keyword
+arguments.
+
+Fix: Compare the call site with the component's `{% def %}` signature. Rename
+misspelled props, add missing required props, or remove props the component does
+not accept.
+
+Example:
+
+```kida
+{% def card(title: str) %}{{ title }}{% end %}
+{{ card(titl="Settings") }}
+```
+
+Use `title=` instead of `titl=`.
+
+### k-cmp-002
+
+**Component literal type mismatch** — A literal argument does not match the
+component parameter annotation. Kida validates literal `str`, `int`, `float`,
+`bool`, `None`, and simple `|` unions. Variable arguments and custom types are
+documentary and skipped.
+
+Fix: Pass a literal with the annotated type, update the annotation if the
+component accepts both shapes, or move validation into Python when the value is
+dynamic.
+
+Example:
+
+```kida
+{% def badge(count: int) %}{{ count }}{% end %}
+{{ badge("five") }}
+```
+
+Pass `5` or change the parameter type if string counts are intentional.
+
+## Privacy Findings (K-PRI-xxx)
+
+Static privacy lint findings are conservative review signals; they never echo
+secret-like literal values.
+
+### k-pri-001
+
+**Sensitive context path** — A template reads a context path whose name looks
+sensitive. Fix: Confirm the value is intended for rendered output.
+
+### k-pri-002
+
+**Secret-like literal** — Template source contains a literal that resembles a
+secret. Fix: Move secrets out of templates and redact fixtures.
+
+### k-pri-003
+
+**Sensitive value marked safe** — A sensitive-looking value bypasses escaping.
+Fix: Remove `| safe` or document and enforce the sanitizer/trust boundary.
+
+### k-pri-004
+
+**Broad context output** — A template appears to render a broad request,
+session, debug, or context object. Fix: Render only the required fields.
+
+### k-pri-005
+
+**Dynamic template name** — A dynamic include/import target cannot be checked
+against a static privacy allowlist. Fix: Prefer literal template names when the
+policy requires static proof.
+
+## Context Contract Findings (K-CTX-xxx)
+
+### k-ctx-001
+
+**Missing context path** — A template dependency is absent from the provided
+route/framework contract. Fix: Provide the path or explicitly mark it optional.
+
+### k-ctx-002
+
+**Unused context path** — Strict extra-data checking found a provided path the
+template does not read. Fix: Remove it or disable extra-data checking for broad
+framework contexts.
+
+## Escape Audit Findings (K-ESC-xxx)
+
+### k-esc-001
+
+**Escaped output** — An output expression is protected by the active render
+surface. This is an informational static observation.
+
+### k-esc-002
+
+**Trusted markup boundary** — `| safe` or an equivalent node bypasses escaping.
+Fix: Document why the value is trusted and sanitized.
+
+### k-esc-003
+
+**Unescaped output** — Autoescape is disabled for an output or template block.
+Fix: Enable escaping or make the trust boundary explicit.
+
+### k-esc-004
+
+**Trusted JSON markup** — `tojson` intentionally returns trusted JSON markup.
+Use `tojson(attr=true)` inside HTML attributes.
+
+### k-esc-005
+
+**Trusted attribute markup** — `xmlattr` intentionally returns trusted HTML
+attribute markup. Ensure its input keys and values are appropriate for output.
+
+## Accessibility Findings (K-A11Y-xxx)
+
+### k-a11y-001
+
+**Image missing alternative text** — A non-decorative `<img>` has no `alt`
+attribute. Fix: Add meaningful `alt` text or an explicit decorative role.
+
+### k-a11y-002
+
+**Heading order skipped** — Heading levels jump by more than one. Fix: Use a
+sequential document outline.
+
+### k-a11y-003
+
+**Document language missing** — `<html>` has no `lang` attribute. Fix: Declare
+the document language.
+
+### k-a11y-004
+
+**Form control missing label** — A form control has no associated `<label>`,
+`aria-label`, or `aria-labelledby`. Fix: Add an accessible name.
+
+## Template Declaration Type Findings (K-TYP-xxx)
+
+### k-typ-001
+
+**Undeclared variable** — A template uses a variable absent from its
+`{% template %}` declaration. Fix: Declare it or correct the reference.
+
+### k-typ-002
+
+**Unused declaration** — A declared template variable is never read. Fix:
+Remove the declaration or use the intended value.
+
+### k-typ-003
+
+**Likely variable typo** — An undeclared variable closely resembles a declared
+name. Fix: Review and apply the suggestion only when semantically correct.
+
+## Template Path Findings (K-PATH-xxx)
+
+### k-path-001
+
+**Fragile same-folder template path** — A same-folder include, extends, embed,
+or import uses a root-relative path. Fix: Use the suggested `./` path so moving
+the folder does not require editing its internal references.
+
+## Modularity Findings (K-MOD-xxx)
+
+### k-mod-102
+
+**Extraction candidate** — Several independent signals suggest that a source
+region may support a typed local component boundary. Review the exact span,
+contributing signals, tentative props and slots, dependencies, and related
+locations before changing source. This opt-in informational diagnostic is
+conservative and never supplies an automatic edit.
+
+### k-mod-103
+
+**Pass-through component** — A local component has exactly one same-owner
+caller and only forwards an identical prop/slot interface to one downstream
+component without owning markup, behavior, accessibility policy, or context.
+Consider calling the downstream component directly. Keep the wrapper when it
+represents a documented public, product, test, or adapter boundary. This
+opt-in informational diagnostic is conservative and never supplies an
+automatic edit.
+
 ## Warnings (K-WARN-xxx)
 
 Compile-time warnings that indicate potential issues but do not prevent rendering.
@@ -270,9 +497,15 @@ Fix: Add parentheses to clarify intent: `(x ?? []) | length`.
 
 ### k-warn-002
 
-**Jinja2 `set` scoping difference** — `{% set %}` is block-scoped in Kida (does not leak out of `{% if %}`, `{% for %}`, etc.). In Jinja2, `{% set %}` modifies the outer scope.
+**Jinja2 `set` scoping difference** — An `{% if %}` branch contains `{% set x = ... %}` whose Jinja binding is read after the block, or it targets a name already bound template-wide via `{% let x %}` or `{% export x %}`. In Kida this creates a branch-scoped value that does not leak to outer scope; in Jinja2 an `if` does not create a scope.
 
-Fix: Use `{% export %}` to write to the outer scope, or `{% let %}` for template-wide assignment. Enable this warning with `Environment(jinja2_compat_warnings=True)`.
+Fix: For a fresh name that must remain visible, use `{% let x = ... %}`. To update an existing template-wide binding, use `{% export x = ... %}`. The diagnostic is advisory and never supplies an automatic edit.
+
+Enabled by default. Suppress with `warnings.filterwarnings("ignore", category=MigrationWarning)` or `Environment(jinja2_compat_warnings=False)`. The read-after-block analysis follows nested `if` branches, stops at unambiguous rebinding, and does not claim that assignments inside Jinja-local `for` scopes escape. Ambiguous binding origins remain unreported.
+
+The warning is also available through `kida check`, `diagnose_source()`, and
+`diagnose_directory()` with its template path, line, suggestion, and proven
+confidence. It is advisory and has no automatic edit.
 
 ## See Also
 

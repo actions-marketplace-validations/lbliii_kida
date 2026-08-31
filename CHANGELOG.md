@@ -7,6 +7,222 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-13
+
+### Added
+
+- Added typed literal modifiers to `{% block %}` and `{% fragment %}`
+  declarations. Immutable `BlockModifierMetadata` records preserve order,
+  scalar values, and source locations for framework introspection without
+  changing rendering, dependency analysis, or structural block hashes. (`#268`)
+- Added report-only downstream canaries for chirp-ui's HTML/component corpus
+  and Milo's terminal/CLI templates. Each job proves it imports the proposed
+  Kida checkout instead of the released wheel, records commit provenance, runs
+  on Python 3.14t with `PYTHON_GIL=0`, uses read-only permissions, and remains
+  safe for public-fork pull requests.
+- Added namespaced `Extension.diagnose()` hooks to programmatic unsaved-source
+  diagnosis. Hooks receive immutable source, AST, and visible component
+  metadata; Kida validates ownership, confidence, current-template locations,
+  and safe-edit snapshots, and isolates failures as partial `K-RUN-007`
+  reports. Rendering, directory diagnosis, and CLI discovery are unchanged.
+- Added snapshot-verified safe edits for strict unified closers. JSON, SARIF,
+  and the public diagnostic model identify the exact `end` keyword replacement,
+  while `kida.diagnostics.apply_safe_edits()` rejects stale, incomplete, or
+  overlapping edits before applying anything. Advisory type, path, component,
+  and migration suggestions remain non-fixing.
+- Added the public `kida.diagnostics` API with immutable diagnostic facts,
+  policy-neutral reports, direct diagnosis of unsaved source buffers,
+  directory collection matching `kida check`, and safe conversion of Kida
+  exceptions for framework adapters. The module does not expand the root
+  `kida.__all__`, mutate environment registries, or add a runtime dependency.
+- Added `kida check --format {text,json,sarif}` with a versioned diagnostics
+  JSON v1 schema and SARIF 2.1.0 output. All three surfaces share one
+  deterministic, deduplicated collection; machine output records partial scans
+  and preserves the existing `0`/`1`/`2` exit policy while default text output
+  and stderr routing remain compatible.
+- Registered static-analysis diagnostics in the public `ErrorCode` enum,
+  retaining existing `K-PRI-*`, `K-CTX-*`, and `K-ESC-*` values and adding
+  stable `K-A11Y-*`, `K-TYP-*`, and `K-PATH-001` mappings. Accessibility,
+  template-declaration type, and fragile-path findings expose computed `code`
+  properties without changing their constructor fields or CLI behavior.
+- Added K-WARN-002 detection for a Jinja `{% set %}` binding read after an
+  `if` block, including nested branches, named blocks, and later reads in the
+  same loop iteration. The advisory remains default-on and has no safe edit.
+
+### Changed
+
+- GitHub pull-request release-note collection now uses typed, fixture-tested
+  Python with pagination, report-contract validation, and explicit failures for
+  malformed responses or invalid ref ranges. (`#139`)
+- The README and thread-safety contract now link the required Python 3.14t
+  no-GIL pull-request lane and scheduled seeded debug-runtime stress evidence.
+  (`#158`)
+- Split the CLI monolith into private command-owned modules behind the unchanged
+  `kida.cli:main` entry point. Argument parsing, lazy dispatch, execution, and
+  structured presentation now have direct test seams; all eight commands keep
+  their flags, help, streams, serialized shapes, and exit statuses. Focused CLI
+  line/branch coverage rose from 53.7% to 94.7%, cold-start medians did not
+  regress, and no dependency was added.
+- Split compiler lowering, analysis, callable plans, block variants, and
+  partial-evaluation tests into phase-owned modules without changing generated
+  output, render surfaces, or the zero-dependency runtime.
+
+### Fixed
+
+- Shared `DependencyWalker`, `PurityAnalyzer`, and `BlockAnalyzer` instances
+  now isolate traversal state across concurrent calls. Thread-safety docs define
+  the stable-source boundary for loaders and read-only metadata mappings. (`#158`)
+- K-WARN-002 now matches Jinja's block-sensitive assignment behavior: it warns
+  for outer-name shadows in non-scoping `if` branches and avoids false positives
+  for loop-local `for` assignments. (`#253`, `#255`)
+- Live renderer updates are serialized under free-threading, and seeded no-GIL
+  stress coverage now exercises shared templates, caches, registries, coverage
+  instrumentation, runtime debugging, and analysis.
+- Streaming error boundaries inside named blocks now preserve fallback behavior
+  across the synchronous and asynchronous render surfaces.
+
+## [0.11.0] - 2026-07-07
+
+### Added
+
+- Added current-version Flask, Django, and FastAPI integration guides and
+  smoke-tested component examples covering full-page and fragment rendering. (`#156`)
+
+### Changed
+
+- Hardened GitHub release automation so releases fail before publishing when the
+  worktree, main commit, tag, or curated release notes do not match. (`#134`)
+- Consolidated duplicate ty checks into the report-producing `Type Check (ty)`
+  CI job so pull requests run one authoritative type-check lane. (`#138`)
+- Included public example tests in the standard pytest, local stability, and CI
+  verification gate. (`#140`)
+- Aligned local and CI Ruff gates so every tracked Python source, test, example,
+  benchmark, and maintenance script is checked consistently. (`#141`)
+- Split partial evaluation into phase-owned modules for constant folding,
+  dead-code elimination, expression transforms, loop unrolling, component
+  inlining, and temporary-node flattening without changing public behavior. (`#143`)
+- Repositioned the README, package metadata, and documentation entrypoints around
+  statically validated server-side components for Python. (`#155`)
+
+### Fixed
+
+- Corrected published installation snippets to use the PyPI distribution name,
+  `kida-templates`, while retaining `kida` as the import package. (`#136`)
+- Made best-effort cache, loader, README detection, terminal-width, and template
+  fallback failures explicit and diagnosable while preserving graceful behavior. (`#145`)
+- Fixed the public design-system example to import component definitions through
+  the supported `{% from ... import ... %}` pattern and added it to CI smoke tests. (`#179`)
+
+## [0.10.0] - 2026-05-30
+
+### Added
+
+- **Structured undefined diagnostics for framework debug views** — `UndefinedError.to_diagnostic()` now returns a surface-neutral payload with error code, kind, location, source snippet, ordered hints, docs URL, metadata, template stack, and component stack. The diagnostic can render escaped HTML fragments/pages or GitHub-flavored Markdown without frameworks parsing terminal-formatted exception strings.
+
+### Fixed
+
+- **Undefined-error source attribution survives optimized rendering paths** — F-string coalescing now preserves the template line marker used by diagnostics, so optimized templates still report the editable source line.
+- **Imported component slot failures point at caller-owned source** — Errors raised inside slot bodies provided to imported components now attribute the primary diagnostic location to the caller template while retaining component-stack context.
+- **Streaming runtime errors use the same template-enhanced diagnostics as full render** — Generic Python exceptions raised during `render_stream()` are wrapped with template name and line information consistently with `render()`.
+
+## [0.9.0] - 2026-05-10
+
+### Breaking
+
+- **`markdown_escape` no longer escapes inline hyphens, parens, hashes, pipes, or tildes** — The autoescape table for `autoescape="markdown"` now only escapes characters that actually trigger formatting at any inline position (`\`, `` ` ``, `*`, `_`, `[`, `]`, `<`). Block-leading markers (`#`, `>`, `-`, `+`, ordered-list digits) are still escaped, but only at line start (after up to 3 spaces of indent). Output for prose, dates, version numbers, identifiers, and function-call syntax is now clean — no more `2026\-04\-24`, `K\-PAR\-001`, or `divide\(1, 0\)` in rendered markdown. **Migration**: regenerate any committed snapshot files comparing markdown-mode output (`pytest --update-snapshots` for the built-in templates). Behavior matches CommonMark/GFM parsing — characters that don't need a backslash to render correctly no longer get one.
+- **`Markup` now implements `__markdown__`** — `{{ value | safe }}` (which returns `Markup`) is now honored by markdown autoescape just like HTML autoescape. Previously, `safe` was a no-op under `autoescape="markdown"` because `Markup` only implemented the `__html__` protocol. Templates that relied on the old behavior will now correctly pass safe content through unescaped.
+
+### Added
+
+- **Route-agnostic context contract checker** — `kida.analysis.check_context_contract()` compares template dependency paths against framework or route-provided context contracts and returns machine-readable `K-CTX-001` / `K-CTX-002` findings for missing or unused context paths.
+- **Static literal attribute extraction** — `kida.analysis.extract_literal_attributes()` reports literal HTML attributes from static template text, including source locations, so frameworks can inspect IDs, targets, and data attributes without AST spelunking.
+- **Static escape audit** — `kida.analysis.audit_escaping()` reports escaped output sites, disabled autoescape blocks, `| safe` uses and `reason=` text, plus trusted-markup-producing filters such as `tojson` and `xmlattr`.
+- **Static privacy lint** — `kida.analysis.lint_privacy()` flags sensitive-looking context paths, secret-like literals, broad debug/context output, `| safe` on sensitive-looking values, and dynamic template names without echoing secret values.
+- **Stabilized component catalog metadata** — Component metadata and `kida components --json` now include more deliberate contract fields for dependencies, source locations, call sites, and slot/default information, with public API snapshot and diagnostics coverage.
+- **Report template contract manifest** — `docs/report-template-contracts.json` records built-in report templates, fixtures, snapshots, surfaces, and AMP schema mappings so template/schema drift is checked explicitly.
+- **Review packet and refactor-safety examples** — New examples show multi-surface review packet rendering and refactor-safe component/template validation workflows with tests.
+- **Agent steward hierarchy** — Root and scoped `AGENTS.md` files now define domain steward responsibilities across runtime, parser, compiler, analysis, render surfaces, docs, tests, schemas, examples, and workflows.
+
+### Changed
+
+- **Report contract hardening** — Built-in report templates now have stronger snapshot, readability, AMP schema, GitHub report, and manifest tests. Markdown table/detail/code-block rendering is covered with fixture-backed checks.
+- **Large-app ergonomics analysis docs** — Advanced analysis docs now cover context contracts, component catalogs, literal attributes, escape audits, privacy linting, and review-packet inspection for framework-scale users.
+- **Benchmark scripts use the project runner** — Benchmark baseline/compare scripts prefer `uv run python` and accept `PYTHON_CMD=...`, avoiding stale global pytest/plugin environments during release gates.
+
+### Fixed
+
+- **Built-in `release-notes` templates pass PR-body markdown through `| safe`** — `body_excerpt` and `body` fields on PRs are now marked safe in `templates/release-notes-report.md` and `templates/release-notes-detailed-report.md`, so headings (`## Summary`), bullet lists, and inline code inside PR bodies render as the PR author intended instead of as backslash-escaped literals inside `<details>` blocks.
+- **Fragment render contract hardening** — Sync and async block rendering now preserve metadata and fragment/block behavior consistently across `render_block`, stream, async, and `render_with_blocks` surfaces.
+- **CLI report rendering accepts list JSON roots** — `kida render` report paths now handle JSON files whose top-level value is a list, matching real CI/tool outputs.
+- **Fragile-path lint no longer crashes on stale AST cache entries** — Bytecode cache metadata now avoids stale optimized-AST failures when the fragile-path lint checks templates after source changes.
+- **Docs Pages build repairs** — Documentation build and release-page collateral were updated so generated docs, API pages, and health checks remain clean for the 0.9.0 release.
+
+## [0.8.0] - 2026-04-24
+
+### Breaking
+
+- **`?.` and `?[...]` soften on Mapping receivers** — Optional chaining now short-circuits missing keys to `None` on any `collections.abc.Mapping` receiver (dict, `MappingProxyType`, `ChainMap`, dict subclasses), mirroring Python's `dict.get(key)` idiom and aligning with TS/Swift mental models. Object attribute misses still raise `UndefinedError` under `strict_undefined` — schema violations on objects are almost always typos. Sequence out-of-range on `?[i]` also still raises in strict mode. **Migration**: if you were relying on `?.` to raise on a missing dict key (the v0.7 behavior), drop the `?.` and use strict access `{{ user.nickname }}`, or use the `get` filter. Most code using the recommended `{{ x?.y ?? "" }}` pattern is unaffected. See `docs/tutorials/upgrade-to-v0.8.md`.
+
+### Added
+
+- **Relative template resolution** — `{% include %}`, `{% extends %}`, `{% embed %}`, and `{% from ... import ... %}` now accept `./` and `../` paths that resolve against the calling template's directory. Moving a folder no longer breaks every reference inside it: `{% include "./_card.html" %}` from `pages/about.html` resolves to `pages/_card.html`, and the same template works unchanged after moving `pages/` anywhere in the tree. Absolute (root-relative) names render byte-identical to before. Path-traversal protection still fires: relative resolution that walks above every loader search root raises `TemplateNotFoundError`. Direct Python callers that pass a relative name without a caller get a clear error pointing at the issue. See `docs/design/rfc-relative-template-resolution.md` for the full design; `kida.utils.template_keys.resolve_template_name()` is the new public helper. (#111)
+- **Namespace aliases for template paths** — `Environment(template_aliases={...})` maps short `@name/` prefixes to root-relative subtrees so cross-cutting component libraries stop being path-coupled. With `template_aliases={"components": "ui/components", "layouts": "ui/layouts"}`, templates can write `{% include "@components/card.html" %}` or `{% extends "@layouts/base.html" %}` regardless of where the caller lives — aliases resolve before loader lookup, so the same prefix works in every cross-template statement. Aliases and `./`/`../` relative paths are orthogonal modes; aliases always resolve to an absolute root. Unknown aliases raise `TemplateNotFoundError` with the list of configured aliases. (#111)
+- **`kida check --lint-fragile-paths`** — Opt-in lint rule that flags cross-template references whose target lives in the same folder as the caller (e.g. `{% include "pages/card.html" %}` from `pages/about.html`) and suggests the refactor-safe `./card.html` form. The rule covers `{% include %}`, `{% extends %}`, `{% embed %}`, `{% import %}`, and `{% from ... import %}`; references that already use `./`, `../`, or `@alias/` are ignored, and only exact same-folder matches are flagged to keep false-positives low. Default `kida check` behavior is unchanged — the rule only runs when the flag is passed. (#111)
+- **Refactor-safe templates tutorial** — New `site/content/docs/tutorials/refactor-safe-templates.md` walks through the folder-move problem, when to use `./` / `../` vs `@alias/`, and a step-by-step migration recipe using `ripgrep`. Cross-linked from the tutorials index and `docs/syntax/includes.md`. (#111)
+- **K-PAR-001 end-tag errors now point at `kida check`** — Orphan `{% end %}`, mismatched closing tags (e.g. `{% endfor %}` against an open `{% if %}`), and typed-end mismatches (e.g. `{% endblock %}` inside a `{% def %}`) now append a tip telling the reader to run `kida check <templates-dir> --strict` to surface every mismatch across the directory at once. New `BULK_CHECK_TIP` constant in `kida.parser.errors`, wired into the five end-tag mismatch paths across `parser/statements.py`, `parser/core.py`, and `parser/blocks/core.py`. (#112)
+- **`ComponentWarning` + K-CMP-001 / K-CMP-002** — Component call validation now emits a dedicated `ComponentWarning` class and structured `K-CMP-*` error codes (`COMPONENT_CALL_SIGNATURE`, `COMPONENT_TYPE_MISMATCH`). `ComponentWarning` is exported from the top-level `kida` package. (#113)
+- **`{% from ... import ... %}` call validation** — Literal `{% from "card.html" import card %}` followed by `{% call card(...) %}` now validates arguments against the imported def's metadata, not just locally-defined defs. (#113)
+- **v0.7 upgrade tutorial** — New `docs/tutorials/upgrade-to-v0.7.md` collects the `strict_undefined=True` migration patterns in one page: TL;DR, the three fix patterns (`is defined`, `??`, `| default`), the `strict_undefined=False` escape hatch, and the preferred `?.` / `?[` / `| get` idioms. Cross-linked from `README.md`, the tutorials index, and the `UndefinedError` troubleshooting page.
+- **v0.8 upgrade tutorial** — New `docs/tutorials/upgrade-to-v0.8.md` documents the `?.` / `?[...]` Mapping-soft semantics, the rationale, and the migration path.
+- **Null-safe hint on `UndefinedError`** — When `kind="attribute/key"`, the error message now includes a second `Hint:` line pointing users at `x?.y`, `x?.y ?? ""`, and `x | get("y", '')` so they stop reaching for `.get("k", "")` under strict mode. Variable-kind errors are unchanged.
+- **Docs: optional chaining surfaced in `docs/syntax/variables.md`** — Added dedicated `?.` and `?[...]` subsections under Attribute Access and Index Access.
+- **`getitem_preserve_none` / `strict_getitem_preserve_none`** — New runtime helpers powering the `?[...]` Mapping-soft semantics. `?[...]` now routes through these helpers (previously emitted direct subscript); Mapping misses return `None`, Sequence out-of-range raises under strict.
+- **Stability gate + `make verify-stability`** — New `docs/stability-gate.md` documents the pre-1.0 stability checklist; `make verify-stability` runs lint, format, `ty`, full pytest with coverage gate, GIL-disabled safety tests, wheel/sdist build, and a clean-venv package smoke test (`scripts/package_smoke.py`). `make verify-rc` remains an alias. (#114)
+- **Public API snapshot + diagnostics contract tests** — `tests/test_public_api_snapshot.py` and `tests/test_diagnostics_contract.py` lock down the exported surface and `ErrorCode` coverage so accidental renames/removals fail loudly. (#114)
+- **Core benchmark regression probes** — `benchmarks/test_benchmark_regression_core.py` and a new `scripts/benchmark_suites.sh` wrap the compile/render/stream/inherited-blocks/concurrent suites behind a single entry point with consistent regression thresholds (5% compile/render/stream, 10% concurrency). (#115, #116)
+
+### Changed
+
+- **Component call validation emits structured `K-CMP-*` diagnostics** — Existing call-signature and type-mismatch warnings now carry `K-CMP-001` / `K-CMP-002` error codes and are filtered as `ComponentWarning` rather than generic `UserWarning`. (#113)
+
+### Performance
+
+- **Compile hot-path trimmed** — Reduced per-template overhead in `compiler/core.py` and trimmed the generated async compile output; the compiler hot path is now the primary pytest-benchmark baseline. (#115)
+- **Dict attribute access fast path** — `compiler/expressions.py` and `template/core.py` avoid redundant casts on Mapping attribute access. (#115)
+- **Render scaffold bypass** — Render accumulator and scope management skip context-manager overhead on the fast path. (#115)
+- **Sandbox output-limit cache** — `max_output_size` lookup is cached per-template rather than re-read on each render. (#115)
+
+### Fixed
+
+- **`from_string()` without `name=` warning now dedups per-source** — The `UserWarning` fired when a bytecode cache is configured and `from_string()` is called without `name=` previously fired on every call (~1000× per test suite for downstream libraries). It now fires once per distinct source per `Environment`, keyed by `bytecode_cache.hash_source(source)`. The first emission and warning text are unchanged, so the discoverability signal is preserved while the spam is eliminated. Two `Environment` instances warn independently; editing the template source re-arms the warning.
+
+## [0.7.0] - 2026-04-20
+
+### Breaking
+
+- **`strict_undefined` now defaults to `True`** — `Environment(strict_undefined=...)` flipped from `False` (lenient) to `True` (strict) to match the documented "strict-by-default" stance. Missing variables **and** missing attribute access raise `UndefinedError` with a descriptive message (variable/attribute/key). Previously the flag was opt-in and missing attributes silently rendered as `""`, contradicting the `__init__.py` docstring. **Migration**: use `is defined`, `??` (null-coalescing), or `| default(...)` — e.g. `{% if user.nickname is defined and user.nickname %}...{% end %}`, `{{ user.nickname ?? "" }}`, or `{{ user.nickname | default("") }}`. **Escape hatch**: pass `strict_undefined=False` on the Environment to restore the prior lenient behavior (transitional shim). (#107)
+
+### Added
+
+- **Parser error hints for Jinja2 traps** — When a template uses a Jinja2-only block keyword that Kida does not accept, the `K-PAR-001` ParseError now prepends a targeted suggestion before the generic "Valid keywords: …" list. Covers `macro` → `{% def %}`, `endmacro`/`endset` → unified `{% end %}`, `namespace` → `{% let %}`/`{% export %}`, and `fill`/`endfill` → `{% slot %}` inside `{% call %}`. The trap table lives in `kida.parser.errors.JINJA2_TRAPS` and is data-only — easy to extend as new traps surface. (#106)
+- **RenderCapture** — Block-level capture, search indexing, and freeze cache. (#99)
+- **Reject non-top-level `{% def %}` / `{% region %}`** — Definitions outside the top level now fail fast at parse time with a retargeted Undefined hint. (#100)
+- **Python 3.14+ idioms** — Adopt `TypedDict`, `match/case`, and `__slots__` across the codebase. (#98)
+- **Render-surface parity corpus & sandbox fuzz** — HTML / terminal / markdown parity corpus, fragment scaffolding, and sandbox fuzz harness for leaf-node hardening. (#103)
+- **`AGENTS.md`** — Contributor safety/values guide for agents working in this repo. (#104)
+
+### Fixed
+
+- **Docs: `{% macro %}` false claim corrected** — `CLAUDE.md`, `docs/syntax/_index.md`, `docs/syntax/functions.md`, `docs/tutorials/migrate-from-jinja2.md`, `.cursor/skills/kida-jinja2-migration/SKILL.md`, and `releases/0.1.0.md` previously implied `{% macro %}` was a valid Kida keyword. It is not (attempts raise `K-PAR-001: Unknown block keyword: macro`). Docs now clearly state that `{% macro %}` must be renamed to `{% def %}` when migrating from Jinja2. (#106)
+- **CoercionWarning coverage** — Warning now extends to collection/number filters; lint gates added to prevent regressions. (#97)
+- **PrecedenceWarning — parenthesized nullish fallback** — Warning no longer fires when the nullish fallback is explicitly parenthesized. (#96)
+- **GitHub Action default Python version** — Bumped from 3.12 to 3.14 to match project support. (#94)
+- **Leaf-node hardening** — Bug fixes, dead-code removal, and test-gap closure across parser/compiler leaf nodes. (#105)
+
+### Changed
+
+- **`jinja2_compat_warnings` defaults to `True`** — `MigrationWarning` (K-WARN-002) now fires out of the box on the canonical Jinja2 `{% set %}` scoping trap (nested `{% set x %}` shadowing an outer `{% let x %}` or `{% export x %}`). The warning was previously silent unless users opted in. The trigger is **narrowly scoped** to the actual trap pattern — fresh names used for legitimate block-scoped work (e.g., loop-local counters) do not warn. Suppress via `Environment(jinja2_compat_warnings=False)` or `warnings.filterwarnings("ignore", category=MigrationWarning)`. Warning message now names the shadowed variable and the shadowing source (`{% let %}` or `{% export %}`) for actionable diagnostics. (#106)
+
 ## [0.6.0] - 2026-04-13
 
 ### Added

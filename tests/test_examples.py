@@ -6,6 +6,7 @@ the goal is to catch API breakage early.
 """
 
 import importlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -17,7 +18,11 @@ EXAMPLES_DIR = Path(__file__).resolve().parent.parent / "examples"
 SMOKE_EXAMPLES = [
     "content_stacks",
     "coverage",
+    "design_system",
+    "encapsulation_loop",
     "extensions",
+    "local_components",
+    "render_capture_manifest",
     "sandbox",
     "terminal_basic",
     "terminal_dashboard",
@@ -30,13 +35,24 @@ SMOKE_EXAMPLES = [
     "terminal_table",
 ]
 
+FRAMEWORK_EXAMPLES = [
+    "flask_components",
+    "django_components",
+    "fastapi_components",
+]
+
 # terminal_live uses LiveRenderer + time.sleep — excluded from smoke tests.
+INVENTORY_EXCLUDE = {"__pycache__"}
 
 
 def _load_example(name: str):
-    """Import an example's run module by path."""
-    run_path = EXAMPLES_DIR / name / "run.py"
-    spec = importlib.util.spec_from_file_location(f"examples.{name}.run", run_path)
+    """Import an example's run or app module by path."""
+    module_path = EXAMPLES_DIR / name / "run.py"
+    if not module_path.exists():
+        module_path = EXAMPLES_DIR / name / "app.py"
+    spec = importlib.util.spec_from_file_location(
+        f"examples.{name}.{module_path.stem}", module_path
+    )
     mod = importlib.util.module_from_spec(spec)
     # Temporarily add src/ to path so `import kida` resolves
     src = str(EXAMPLES_DIR.parent / "src")
@@ -58,3 +74,35 @@ def test_example_runs(example, capsys):
     # Sanity check: most examples produce some output
     captured = capsys.readouterr()
     assert len(captured.out) > 0, f"Example {example!r} produced no output"
+
+
+@pytest.mark.parametrize("example", FRAMEWORK_EXAMPLES)
+def test_framework_example_smoke(example: str) -> None:
+    """Run optional-framework examples in isolated processes."""
+    example_dir = EXAMPLES_DIR / example
+    result = subprocess.run(
+        [sys.executable, "app.py", "--smoke"],
+        cwd=example_dir,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"{example} OK" in result.stdout
+
+
+def test_runnable_examples_are_listed_in_readme():
+    """Every top-level runnable example should be discoverable from examples/README.md."""
+    readme = (EXAMPLES_DIR / "README.md").read_text(encoding="utf-8")
+    runnable = sorted(
+        path.name
+        for path in EXAMPLES_DIR.iterdir()
+        if path.is_dir()
+        and path.name not in INVENTORY_EXCLUDE
+        and ((path / "app.py").exists() or (path / "run.py").exists())
+    )
+
+    missing = [name for name in runnable if f"`{name}/`" not in readme]
+    assert missing == []

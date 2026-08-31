@@ -28,11 +28,25 @@ icon: terminal
 
 # CLI Reference
 
-Kida ships six subcommands: `check`, `render`, `fmt`, `components`, `readme`, and `extract`. All are available through the `kida` entry point or `python -m kida`.
+Kida ships eight subcommands: `check`, `render`, `fmt`, `components`, `readme`, `extract`, `manifest`, and `diff`. All are available through the `kida` entry point or `python -m kida`.
 
 ```bash
 kida <command> [options]
 ```
+
+## Contract Status
+
+The public CLI contract is the set of subcommands and flags documented here.
+Output text can become clearer, but machine-readable JSON shapes for
+`check --format json`, `components --json`, `readme --json`, and `manifest`
+should only change deliberately with docs and changelog updates when behavior
+changes.
+
+The stable Python entry point is `kida.cli:main`. Command implementations are
+loaded lazily after argparse selects a subcommand, so importing the entry point
+does not load diagnostic, formatting, extraction, README, manifest, or render
+command machinery. The private `kida._cli` package is an implementation detail,
+not an additional programmatic API.
 
 ## kida check
 
@@ -40,6 +54,7 @@ Parse all `.html` templates under a directory. Reports syntax errors, loader res
 
 ```bash
 kida check <template_dir> [flags]
+kida check --root <namespace>=<directory> [--root ...] [flags]
 ```
 
 **Positional argument:**
@@ -53,9 +68,12 @@ kida check <template_dir> [flags]
 | Flag | Description |
 |------|-------------|
 | `--strict` | Fail on bare `{% end %}` closers. Requires explicit `{% endif %}`, `{% endblock %}`, `{% endcall %}`, etc. |
-| `--validate-calls` | Validate macro call sites against `{% def %}` signatures. Reports unknown parameters, missing required parameters, and duplicates. |
+| `--validate-calls` | Validate macro call sites against `{% def %}` signatures. Reports unknown parameters and missing required parameters. Duplicate keyword arguments are rejected earlier as parser errors. |
 | `--a11y` | Check templates for accessibility issues (missing `alt` attributes, heading order, etc.). |
 | `--typed` | Type-check templates against `{% template %}` declarations. |
+| `--lint-fragile-paths` | Suggest `./` relative paths for same-folder include, extends, embed, and import statements so folder moves stay zero-edit. Programmatic `FragilePathIssue` records expose `K-PATH-001`; CLI text remains unchanged. |
+| `--format {text,json,sarif}` | Select human text, Kida diagnostics JSON v1, or SARIF 2.1.0 output. Defaults to `text`. |
+| `--root NAMESPACE=PATH` | Inspect an explicitly namespaced root. Repeat for multiple roots; cannot be combined with `template_dir`. |
 
 ### Examples
 
@@ -74,8 +92,24 @@ kida check templates/ --strict --validate-calls
 Full lint pass (all checks enabled):
 
 ```bash
-kida check templates/ --strict --validate-calls --a11y --typed
+kida check templates/ --strict --validate-calls --a11y --typed --lint-fragile-paths
 ```
+
+Validate explicit framework and application roots:
+
+```bash
+kida check \
+  --root framework=framework/templates \
+  --root app=app/templates \
+  --validate-calls
+```
+
+Multi-root template identifiers are stable and namespaced, such as
+`framework/components/card.html`. Cross-root imports use that full identifier.
+Root order does not create an implicit override: duplicate namespaces or
+logical identifiers are `K-TPL-005` configuration errors. JSON and SARIF retain
+the logical identifier as the diagnostic path and add `owner` and
+`source_path` metadata.
 
 ### Output format
 
@@ -86,6 +120,54 @@ layouts/base.html: unexpected tag 'endblock'
 partials/nav.html:12: strict: unified {% end %} closes 'if' — prefer {% endif %}
 components/card.html:8: a11y/img-alt [WARNING]: <img> missing alt attribute
 ```
+
+`--validate-calls` diagnostics use stable `K-CMP-*` codes:
+
+```
+components/page.html:12: K-CMP-001: Call to 'card' — missing required: title
+components/page.html:18: K-CMP-002: type: card() param 'count' expects int, got str ('many')
+```
+
+Text output goes to stderr. JSON and SARIF go to stdout, so either machine
+format can be redirected without mixing in human progress text:
+
+```bash
+kida check templates/ --typed --a11y --format json > diagnostics.json
+kida check templates/ --strict --format sarif > diagnostics.sarif
+```
+
+The JSON envelope is versioned by `schema_version` and includes the resolved
+`root`, ordered `diagnostics`, severity `summary`, `partial` collection status,
+and `exit_code`. Its published schema is
+[`schemas/diagnostics/v1/check.schema.json`](https://github.com/lbliii/kida/blob/main/schemas/diagnostics/v1/check.schema.json).
+Each diagnostic always includes its stable code, category, severity, message,
+path/range, optional suggestion and safe edit, related locations, confidence,
+notes, documentation URL, source snippet, and metadata. Kida source columns are
+zero-based in JSON; SARIF columns are converted to SARIF's one-based convention.
+
+Machine-readable findings are deterministically ordered by validation phase,
+path, range, code, and message. Exact duplicates with the same code, path,
+range, and message are emitted once. A failed template does not stop the rest
+of the directory scan; `partial: true` records that at least one requested
+analysis could not be completed.
+
+Diagnostic confidence describes the kind of evidence behind a finding:
+
+- `proven` means parsing or static analysis established the finding.
+- `conservative` means static analysis intentionally chose the safe warning
+  when it could not rule a problem out.
+- `runtime-only` means the fact came from execution and cannot be claimed as a
+  compile-time proof.
+- `unknown` means the producer has not classified its evidence yet.
+
+Exit status is `0` when there are no findings, `1` when any enabled check emits
+a finding, and `2` for an invalid invocation or template root. Severity labels
+do not change this existing check policy.
+
+In JSON and SARIF modes, strict unified-closer findings include a safe edit for
+the exact `end` keyword plus a source snapshot. Python tooling can apply those
+fixes with `kida.diagnostics.apply_safe_edits()`, which rejects stale or
+overlapping edits before changing source. Human text output remains unchanged.
 
 ## kida render
 
@@ -189,6 +271,7 @@ List all `{% def %}` components across templates in a directory. Useful for audi
 
 ```bash
 kida components <template_dir> [flags]
+kida components --root <namespace>=<directory> [--root ...] [flags]
 ```
 
 **Positional argument:**
@@ -203,6 +286,7 @@ kida components <template_dir> [flags]
 |------|---------|-------------|
 | `--json` | off | Output as JSON for machine consumption. |
 | `--filter NAME` | none | Filter components by name (case-insensitive substring match). |
+| `--root NAMESPACE=PATH` | none | Inspect an explicitly namespaced root. Repeat for multiple roots; cannot be combined with `template_dir`. |
 
 ### Examples
 
@@ -224,6 +308,19 @@ Machine-readable output:
 kida components templates/ --json
 ```
 
+Inspect multiple explicitly owned component roots:
+
+```bash
+kida components \
+  --root framework=framework/templates \
+  --root app=app/templates \
+  --json
+```
+
+Multi-root JSON rows add `owner` and resolved `source_path` fields while
+retaining the existing component metadata fields. Configuration failures return
+an object containing `components`, structured `diagnostics`, and `partial`.
+
 ### Output format
 
 Human-readable output groups by template file:
@@ -239,7 +336,50 @@ components/nav.html
 2 component(s) found.
 ```
 
-JSON output produces an array of objects with `name`, `template`, `lineno`, `params`, `slots`, and `has_default_slot` fields.
+JSON output produces an array of objects with `name`, `template`, `lineno`,
+`params`, `slots`, `has_default_slot`, `depends_on`, `vararg`, and `kwarg`
+fields. Each param includes `name`, `annotation`, `has_default`, and
+`required`.
+
+## kida manifest
+
+Render templates with capture instrumentation and emit a render manifest as
+JSON. Frameworks can use this to track rendered block fragments and context
+keys.
+
+```bash
+kida manifest <template_dir> [flags]
+```
+
+**Positional argument:**
+
+| Argument | Description |
+|----------|-------------|
+| `template_dir` | Root directory passed to `FileSystemLoader`. All `*.html` and `*.kida` files are scanned recursively. |
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o`, `--output FILE` | stdout | Write manifest JSON to a file. |
+| `--data FILE` | none | JSON object mapping template names to context dictionaries. |
+| `--search` | off | Output a search manifest instead of the raw capture manifest. |
+
+## kida diff
+
+Compare two render manifests and report added, removed, and changed fragment
+content hashes.
+
+```bash
+kida diff <old_manifest> <new_manifest>
+```
+
+**Positional arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `old_manifest` | Path to the previous manifest JSON file. |
+| `new_manifest` | Path to the new manifest JSON file. |
 
 ## kida readme
 

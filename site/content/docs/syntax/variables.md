@@ -59,6 +59,33 @@ For non-dict objects (dataclasses, custom classes), dot notation uses `getattr` 
 
 > **Jinja2 difference**: Jinja2 always tries `getattr` first regardless of type, so `{{ data.items }}` resolves to the `dict.items` method. Kida handles this correctly for dicts.
 
+### Optional Chaining — `?.` and `?[...]`
+
+`?.` and `?[...]` short-circuit missing lookups to `None` (which renders as `""`) when:
+
+- The **receiver** is `None` or undefined, **or**
+- The receiver is a **Mapping** (`dict` or `collections.abc.Mapping` subclass) and the key is missing.
+
+Missing attributes on a non-Mapping **object** still raise `UndefinedError` under strict mode — preserving typo detection against object schemas. Missing indices on a **Sequence** (list, tuple) also still raise.
+
+```kida
+{{ user?.nickname }}                {# user = None     → "" #}
+{{ user?.nickname }}                {# user = {}       → "" (Mapping miss) #}
+{{ user?.nickname }}                {# user = User()   → UndefinedError (object attr) #}
+{{ cfg?["theme"] }}                 {# cfg  = {}       → "" (Mapping miss) #}
+{{ items?[5] }}                     {# items = [1,2,3] → UndefinedError (out-of-range) #}
+{{ page?.author?.avatar }}          {# chain short-circuits at any None or missing Mapping key #}
+```
+
+Rule of thumb: `?.` on Mappings behaves like Python's `dict.get(key)`. On objects, it's a null-guard on the receiver only; combine with `?? ""` when the attribute itself may be missing:
+
+```kida
+{{ user?.nickname ?? "Guest" }}     {# safe for both object-attr misses and None receivers #}
+{{ user | get("nickname", "") }}    {# filter form; also works for dict-like get #}
+```
+
+> **Changed in v0.8.0**: `?.` and `?[...]` on Mapping receivers now short-circuit missing keys to `None` (previously raised under `strict_undefined`). See the [v0.8.0 upgrade tutorial](/docs/tutorials/upgrade-to-v0.8/).
+
 ## Index Access
 
 Access sequence items by index:
@@ -67,6 +94,15 @@ Access sequence items by index:
 {{ items[0] }}
 {{ items[-1] }}  {# Last item #}
 {{ matrix[0][1] }}
+```
+
+### Optional Index — `?[...]`
+
+Mirror of `?.` for subscript access. Short-circuits to `None` when the receiver is `None` or undefined:
+
+```kida
+{{ settings?["theme"] }}
+{{ items?[0] ?? "missing" }}
 ```
 
 ## HTML Escaping

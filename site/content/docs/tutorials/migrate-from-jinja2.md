@@ -32,7 +32,7 @@ Kida is **not** compatible with Jinja2. Templates must be rewritten using Kida s
 ## Step 1: Install Kida
 
 ```bash
-pip install kida
+pip install kida-templates
 ```
 
 ## Step 2: Update Imports
@@ -76,11 +76,10 @@ env = Environment(
 
 Note: Kida does not use Jinja2-style extensions. For side effects, use `{% set _ = expr %}`.
 
-## Step 4: Rewrite Block Endings
+## Step 4: Keep Matching Block Endings
 
-Convert specific endings to unified `{% end %}`:
-
-**Jinja2:**
+No migration edit is required for matching explicit closers on constructs Kida
+supports. The following Jinja source is valid in Kida unchanged:
 
 ```jinja2
 {% if condition %}
@@ -96,7 +95,8 @@ Convert specific endings to unified `{% end %}`:
 {% endblock %}
 ```
 
-**Kida:**
+Unified `{% end %}` remains canonical Kida style, so you may normalize the same
+template later as an optional style cleanup:
 
 ```kida
 {% if condition %}
@@ -177,13 +177,35 @@ def is_prime(n):
 
 | Jinja2 | Kida |
 |--------|------|
-| `{% endif %}` | `{% end %}` |
-| `{% endfor %}` | `{% end %}` |
-| `{% endblock %}` | `{% end %}` |
+| `{% endif %}` | Accepted unchanged; `{% end %}` is the canonical alternative |
+| `{% endfor %}` | Accepted unchanged; `{% end %}` is the canonical alternative |
+| `{% endblock %}` | Accepted unchanged; `{% end %}` is the canonical alternative |
+| `{% macro name(...) %}` | `{% def name(...) %}` (Kida has no `{% macro %}` keyword) |
 | `{% endmacro %}` | `{% end %}` |
 | `{{ x \| filter }}` | `{{ x \|> filter }}` (pipeline) |
 | `{% if %}...{% elif %}...{% endif %}` | `{% match %}...{% case %}...{% end %}` |
 | N/A | `{% cache key %}...{% end %}` |
+
+### Audit assignments that cross an `if` block
+
+Jinja2 lets an assignment inside `{% if %}` update the surrounding scope;
+Kida keeps `{% set %}` block-scoped. `kida check` reports K-WARN-002 when it
+can prove that such a binding is read after the block:
+
+```jinja2
+{% if user %}
+  {% set greeting = "Hello " ~ user.name %}
+{% endif %}
+{{ greeting }}
+```
+
+Use `{% let greeting = ... %}` when the name is first introduced and should
+be template-wide. Use `{% export greeting = ... %}` when updating an existing
+template-wide binding. Assignments do not escape `{% for %}` in either engine;
+an `if`-local assignment read later in the same iteration can still be reported
+with loop-local restructuring advice. K-WARN-002 is advisory only because
+control flow, shadowing, and dynamic values can make an automatic rewrite
+unsound.
 
 ## New Features
 
@@ -254,17 +276,19 @@ env.add_filter('name', func)  # Not env.filters['name'] = func
 
 ### Block Endings
 
-**Error**: `TemplateSyntaxError: Unexpected tag 'endif'`
-
-**Fix**: Use unified `{% end %}`:
+Matching explicit closers are accepted. If Kida reports a block-ending error,
+check that the closer matches the open construct. Both of these are valid:
 
 ```kida
-{% if x %}...{% end %}  # Not {% endif %}
+{% if x %}...{% endif %}
+{% if x %}...{% end %}  {# canonical Kida style #}
 ```
+
+Do not blanket-rewrite `endif`, `endfor`, or `endblock` during migration.
 
 ## See Also
 
-- [[docs/tutorials/component-comparison|Jinja2 vs Kida Components]] — Side-by-side component comparison
+- [[docs/tutorials/component-comparison|Kida Components vs Jinja2 Macros]] — Side-by-side component comparison
 - [[docs/usage/components|Components Guide]] — Kida component patterns
 - [[docs/syntax/control-flow|Control Flow]] — Pattern matching syntax
 - [[docs/about/comparison|Comparison]] — Kida vs Jinja2

@@ -30,11 +30,11 @@ Unlike Jinja2 which generates Python source strings, Kida generates
 compile-time optimization, and precise error source mapping.
 
 Thread-Safety:
-All public APIs are thread-safe by design:
+Rendering and template lookup APIs are thread-safe by design:
 - Template compilation is idempotent (same input → same output)
 - Rendering uses only local state (StringBuilder pattern, no shared buffers)
-- Environment caching uses copy-on-write for filters/tests/globals
-- LRU caches use atomic operations (no locks required)
+- Configure filters/tests/globals at startup; readers use copy-on-write state
+- LRU caches use internal RLocks; compound environment cache state shares a lock
 
 Free-Threading (PEP 703):
 Declares GIL-independence via `_Py_mod_gil = 0` attribute.
@@ -59,12 +59,20 @@ Key Differences from Jinja2:
 - **Pattern Matching**: `{% match %}...{% case %}` for cleaner branching
 
 Strict Mode (default):
-Undefined variables raise `UndefinedError` instead of silently returning
-empty string. Use `| default(fallback)` for optional variables:
+Undefined variables and undefined attribute access raise `UndefinedError`
+instead of silently returning empty string. Use `| default(fallback)`,
+`is defined` guards, or the `??` null-coalescing operator for optional values:
 
     >>> env.from_string("{{ missing }}").render()  # Raises UndefinedError
     >>> env.from_string("{{ missing | default('N/A') }}").render()
     'N/A'
+    >>> env.from_string("{{ user.missing ?? '' }}").render(user={})
+    ''
+
+Opt out (per-Environment) when porting templates that rely on lenient
+attribute access:
+
+    >>> env = Environment(strict_undefined=False)
 
 """
 
@@ -82,6 +90,7 @@ from kida.coverage import CoverageCollector, CoverageResult
 from kida.environment import (
     ChoiceLoader,
     CoercionWarning,
+    ComponentWarning,
     DictLoader,
     Environment,
     ErrorCode,
@@ -108,12 +117,27 @@ from kida.render_accumulator import (
     profiled_render,
     timed_block,
 )
+from kida.render_capture import (
+    Fragment,
+    RenderCapture,
+    captured_render,
+    get_capture,
+)
 from kida.render_context import (
     RenderContext,
     async_render_context,
     get_render_context,
     get_render_context_required,
     render_context,
+)
+from kida.render_manifest import (
+    FreezeCache,
+    FreezeCacheStats,
+    ManifestDiff,
+    RenderManifest,
+    SearchEntry,
+    SearchManifestBuilder,
+    default_field_extractor,
 )
 from kida.sandbox import SandboxedEnvironment, SandboxPolicy, SecurityError
 from kida.template import AsyncLoopContext, LoopContext, Markup, RenderedTemplate, Template
@@ -133,12 +157,17 @@ from kida.utils.workers import (
 # Python 3.14+ t-string support (PEP 750)
 # Only import if string.templatelib is available
 k: Callable[..., str] | None
+plain: Callable[..., str] | None
 try:
-    from kida.tstring import k, plain
+    from kida.tstring import k as _k
+    from kida.tstring import plain as _plain
+
+    k = _k
+    plain = _plain
 except ImportError:
     # Pre-3.14 Python - t-strings not available
-    k = None  # type: ignore[assignment]
-    plain = None  # type: ignore[assignment]
+    k = None
+    plain = None
 
 __version__ = version("kida-templates")
 
@@ -172,8 +201,10 @@ __all__ = [
     "AnalysisConfig",
     "AsyncLoopContext",
     "BlockMetadata",
+    "BlockModifierMetadata",
     "ChoiceLoader",
     "CoercionWarning",
+    "ComponentWarning",
     "CoverageCollector",
     "CoverageResult",
     "DefMetadata",
@@ -183,19 +214,27 @@ __all__ = [
     "ErrorCode",
     "Extension",
     "FileSystemLoader",
+    "Fragment",
+    "FreezeCache",
+    "FreezeCacheStats",
     "FunctionLoader",
     "KidaWarning",
     "LoopContext",
+    "ManifestDiff",
     "Markup",
     "MigrationWarning",
     "PackageLoader",
     "PrecedenceWarning",
     "PrefixLoader",
     "RenderAccumulator",
+    "RenderCapture",
     "RenderContext",
+    "RenderManifest",
     "RenderedTemplate",
     "SandboxPolicy",
     "SandboxedEnvironment",
+    "SearchEntry",
+    "SearchManifestBuilder",
     "SecurityError",
     "SourceSnippet",
     "Template",
@@ -215,7 +254,10 @@ __all__ = [
     "__version__",
     "async_render_context",
     "build_source_snippet",
+    "captured_render",
+    "default_field_extractor",
     "get_accumulator",
+    "get_capture",
     "get_optimal_workers",
     "get_profile",
     "get_render_context",
@@ -239,6 +281,7 @@ _LAZY_ANALYSIS = frozenset(
     {
         "AnalysisConfig",
         "BlockMetadata",
+        "BlockModifierMetadata",
         "DefMetadata",
         "DefParamInfo",
         "TemplateMetadata",
@@ -259,6 +302,7 @@ def __getattr__(name: str) -> object:
         from kida.analysis import (
             AnalysisConfig,
             BlockMetadata,
+            BlockModifierMetadata,
             DefMetadata,
             DefParamInfo,
             TemplateMetadata,
@@ -269,6 +313,7 @@ def __getattr__(name: str) -> object:
         globals().update(
             AnalysisConfig=AnalysisConfig,
             BlockMetadata=BlockMetadata,
+            BlockModifierMetadata=BlockModifierMetadata,
             DefMetadata=DefMetadata,
             DefParamInfo=DefParamInfo,
             TemplateMetadata=TemplateMetadata,

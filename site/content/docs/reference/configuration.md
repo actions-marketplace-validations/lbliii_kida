@@ -59,11 +59,11 @@ loader = DictLoader({"page.html": "..."})
 
 ### autoescape
 
-HTML auto-escaping for output.
+Escaping mode for output.
 
 | Type | Default | Description |
 |------|---------|-------------|
-| `bool \| Callable` | `True` | Enable escaping |
+| `bool \| "html" \| "terminal" \| "markdown" \| Callable` | `True` | Select escaping behavior |
 
 ```python
 # Always escape
@@ -71,6 +71,12 @@ autoescape=True
 
 # Never escape
 autoescape=False
+
+# Terminal ANSI-safe escaping
+autoescape="terminal"
+
+# GitHub-flavored Markdown escaping
+autoescape="markdown"
 
 # Conditional by filename
 def should_escape(name):
@@ -80,6 +86,8 @@ def should_escape(name):
 
 autoescape=should_escape
 ```
+
+Markdown mode is for generated Markdown such as GitHub step summaries, PR comments, and release notes. It escapes CommonMark/GFM formatting triggers while keeping ordinary punctuation readable. Since 0.9.0, inline hyphens, parentheses, hashes, pipes, and tildes are not escaped unless they appear where Markdown treats them as block markers. Values marked with `| safe` or `Markup(...)` bypass Markdown escaping through `__markdown__`, so only mark trusted Markdown safe.
 
 ### auto_reload
 
@@ -173,6 +181,11 @@ bytecode_cache=False
 # Custom location
 bytecode_cache=BytecodeCache("__pycache__/kida/")
 ```
+
+Bytecode cache files are trusted application state. Store them in an
+application-owned directory, not a shared or user-writable location: cache files
+contain marshalled code and serialized compiler data, and the sandbox does not
+treat bytecode cache contents as untrusted input.
 
 ### static_context
 
@@ -295,32 +308,46 @@ Strict attribute access — raise `UndefinedError` on missing attributes instead
 
 | Type | Default | Description |
 |------|---------|-------------|
-| `bool` | `False` | Raise on missing attributes |
+| `bool` | `True` | Raise on missing attributes |
 
 ```python
-# Lenient (default): missing attributes return _Undefined sentinel
-strict_undefined=False
-
-# Strict: missing attributes raise UndefinedError immediately
+# Strict (default): missing attributes raise UndefinedError immediately
 strict_undefined=True
+
+# Lenient: missing attributes return the _Undefined sentinel (renders as "")
+strict_undefined=False
 ```
 
-When enabled, `{{ user.typo }}` raises immediately instead of rendering as empty string. Useful for catching attribute typos during development. Error messages distinguish between "Undefined variable", "Undefined attribute", and "Undefined key".
+By default, `{{ user.typo }}` raises immediately instead of rendering as empty string — the same contract as undefined top-level variables. Error messages distinguish between "Undefined variable", "Undefined attribute", and "Undefined key", and include `did you mean …` suggestions.
+
+To keep the lenient behavior on a specific `Environment` (useful when migrating templates that rely on optional attributes), pass `strict_undefined=False`. The preferred in-template idioms for optional data are:
+
+- `{{ user.bio ?? "" }}` — null-coalescing
+- `{% if user.bio is defined and user.bio %}` — existence guard
+- `{{ user.bio | default("") }}` — filter with fallback
 
 ### jinja2_compat_warnings
 
-Emit `MigrationWarning` when `{% set %}` is used inside blocks where Jinja2 scoping would differ from Kida.
+Emit `MigrationWarning` when an `{% if %}`-local `{% set %}` is read after its Kida block, or shadows a name already bound template-wide — the Jinja2 scoping trap.
 
 | Type | Default | Description |
 |------|---------|-------------|
-| `bool` | `False` | Warn on Jinja2 scoping differences |
+| `bool` | `True` | Warn on `{% set %}` in an `if` branch that shadows a template-scope binding |
 
 ```python
-# Enable for migration (recommended when porting from Jinja2)
+# Default — catches the Jinja2 trap
 jinja2_compat_warnings=True
+
+# Silence the warning entirely
+jinja2_compat_warnings=False
+
+# Or filter via stdlib warnings:
+# warnings.filterwarnings("ignore", category=MigrationWarning)
 ```
 
-When enabled, using `{% set x = ... %}` inside `{% if %}`, `{% for %}`, or other blocks emits a `MigrationWarning` (K-WARN-002) explaining that `{% set %}` is block-scoped in Kida and does not leak to the outer scope. The warning suggests `{% export %}` or `{% let %}` as alternatives.
+When enabled, a template like `{% if cond %}{% set x = 2 %}{% end %}{{ x }}` emits a `MigrationWarning` (K-WARN-002) because Jinja2 lets the assignment flow through `if`, while Kida does not. A fresh name suggests `{% let %}`; an update to an existing template-wide binding suggests `{% export %}`.
+
+The warning is **narrowly scoped** to proven reads and shadowing. A loop-local assignment is never claimed to escape a `for`; an `if` assignment read later in the same loop iteration can still be reported with loop-local restructuring advice.
 
 ### fstring_coalescing
 
@@ -379,7 +406,7 @@ Enable compile-time call-site validation for `{% def %}` functions.
 |------|---------|-------------|
 | `bool` | `False` | Validate call sites against `{% def %}` signatures |
 
-When enabled, the compiler checks every `{{ func(...) }}` call against the matching `{% def %}` signature and emits `UserWarning` for unknown parameters, missing required arguments, and other mismatches.
+When enabled, the compiler checks every `{{ func(...) }}` call against the matching `{% def %}` signature and emits `UserWarning` for unknown parameters, missing required arguments, and other mismatches. Duplicate keyword arguments are rejected by the parser before validation runs.
 
 ```python
 # Enable call validation (recommended for development/CI)

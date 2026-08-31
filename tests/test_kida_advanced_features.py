@@ -817,17 +817,21 @@ class TestCallSiteValidation:
         assert len(issues) == 1
         assert "title" in issues[0].missing_required
 
-    def test_duplicate_param_last_wins(self):
-        """Duplicate kwargs are deduplicated by the parser (last-wins).
+    def test_duplicate_param_rejected_by_parser(self):
+        """Duplicate kwargs are rejected before analysis loses occurrence data."""
+        from kida.parser.errors import ParseError
 
-        The AST stores kwargs in a dict, so duplicates can't be detected
-        at the analysis level. The call is valid since 'title' is provided.
-        """
-        issues = self._validate(
-            "{% def card(title) %}{{ title }}{% end %}{{ card(title='a', title='b') }}"
-        )
-        # No issues — the dict already deduplicated the kwargs
-        assert issues == []
+        with pytest.raises(ParseError, match="Duplicate keyword argument: title"):
+            self._validate(
+                "{% def card(title) %}{{ title }}{% end %}{{ card(title='a', title='b') }}"
+            )
+
+    def test_positional_arg_after_keyword_rejected_by_parser(self):
+        """Call args follow Python's positional-before-keyword rule."""
+        from kida.parser.errors import ParseError
+
+        with pytest.raises(ParseError, match="Positional argument cannot follow keyword argument"):
+            self._validate("{% def card(title) %}{{ title }}{% end %}{{ card(title='a', 'b') }}")
 
     def test_vararg_relaxes_positional(self):
         """*args in def relaxes positional validation."""
@@ -859,9 +863,13 @@ class TestCallSiteValidation:
         env = Environment(validate_calls=True)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            env.from_string("{% def card(title) %}{{ title }}{% end %}{{ card(titl='oops') }}")
+            tpl = env.from_string(
+                "{% def card(title) %}{{ title }}{% end %}{{ card(titl='oops') }}"
+            )
         assert len(w) == 1
         assert "titl" in str(w[0].message)
+        assert "K-CMP-001" in str(w[0].message)
+        assert tpl.warnings[0].code.value == "K-CMP-001"
 
     def test_environment_validate_calls_disabled_by_default(self):
         """By default, no validation warnings are emitted."""
@@ -883,6 +891,30 @@ class TestCallSiteValidation:
         )
         assert len(issues) == 1
         assert "titl" in issues[0].unknown_params
+
+    def test_imported_def_validated_by_environment(self):
+        """Literal from-imported defs participate in Environment validation."""
+        import warnings
+
+        from kida import DictLoader
+
+        env = Environment(
+            loader=DictLoader(
+                {
+                    "components.html": "{% def card(title) %}{{ title }}{% end %}",
+                    "page.html": (
+                        "{% from \"components.html\" import card %}{{ card(titl='oops') }}"
+                    ),
+                }
+            ),
+            validate_calls=True,
+        )
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            env.get_template("page.html")
+        assert len(w) == 1
+        assert "K-CMP-001" in str(w[0].message)
+        assert "titl" in str(w[0].message)
 
     def test_is_valid_property(self):
         """CallValidation.is_valid returns False when issues exist."""

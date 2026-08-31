@@ -18,6 +18,197 @@ icon: code
 
 # API Reference
 
+## Contract Status
+
+The framework-author surface below is treated as the documented integration
+contract:
+
+- imports exported from `kida.__all__`
+- names exported from the public `kida.diagnostics` module
+- `AdviceContext` and `AdviceFactValue` from `kida.analysis`
+- `Extension` and `ExtensionDiagnosticContext` from `kida.extensions`
+- `ErrorCode` names and values
+- `Environment(...)` constructor parameters
+- `Template` render, block-render, streaming, and metadata methods
+- metadata dataclass fields for `BlockMetadata`, `BlockModifierMetadata`, `DefParamInfo`,
+  `DefMetadata`, `TemplateMetadata`, and `TemplateStructureManifest`
+- render-capture records, manifests, diffs, freeze-cache analysis, and search
+  manifest helpers exported from `kida`
+- loader constructor behavior documented on this page
+- sandbox, render context, capture, and manifest objects exported from `kida`
+
+Snapshot tests guard those contracts. Any change to the stable surface should be
+deliberate and land with docs and changelog updates when behavior changes.
+
+Internals remain internal even when they are visible to Python: underscored
+attributes, generated template namespace entries, parser/compiler node shapes,
+cache implementation details, and helper functions outside `kida.__all__`.
+
+## Programmatic Diagnostics
+
+`kida.diagnostics` exposes immutable, surface-neutral findings for editors,
+framework adapters, codemods, and other Python tooling. It is a public module,
+but its names are deliberately not copied into the root `kida` namespace.
+
+```python
+from kida.diagnostics import DiagnosticOptions, diagnose_source
+
+report = diagnose_source(
+    unsaved_editor_text,
+    name="pages/account.html",
+    environment=env,
+    options=DiagnosticOptions(
+        validate_calls=True,
+        typed=True,
+        a11y=True,
+    ),
+)
+
+for finding in report.diagnostics:
+    start = finding.span.start
+    print(finding.code, finding.message, start.line if start else None)
+```
+
+`diagnose_source()` parses and compiles the supplied text directly so compiler
+warnings are included alongside analysis findings. The unsaved buffer is not
+added to the environment's template or bytecode caches. A supplied
+`Environment` contributes lexer/parser configuration, extensions, autoescape
+selection, and loader-backed imported component metadata. Resolving imports may
+use that environment's existing thread-safe template cache; registries are not
+mutated.
+
+Use `diagnose_directory()` for the same collection and options as `kida check`:
+
+```python
+from kida.diagnostics import DiagnosticOptions, diagnose_directory
+
+report = diagnose_directory(
+    "templates",
+    options=DiagnosticOptions(strict=True, lint_fragile_paths=True),
+)
+```
+
+For explicit multi-root tooling, use the public `kida.inspection` inventory:
+
+```python
+from pathlib import Path
+
+from kida.diagnostics import DiagnosticOptions
+from kida.inspection import TemplateRoot, diagnose_roots, inspect_components
+
+roots = (
+    TemplateRoot("framework", Path("framework/templates")),
+    TemplateRoot("app", Path("app/templates")),
+)
+
+report = diagnose_roots(
+    roots,
+    options=DiagnosticOptions(validate_calls=True),
+)
+catalog = inspect_components(roots)
+```
+
+Logical names are always `namespace/relative/path`; no root-order override is
+inferred. `ComponentRecord` preserves the owner, logical template identifier,
+resolved source path, and immutable `DefMetadata`. `ComponentInspection` also
+returns structured configuration/load diagnostics and a `partial` flag.
+
+Adapters that need custom filters, globals, tests, or extensions can pass a
+preconfigured `Environment` whose loader resolves the same prefixed names:
+
+```python
+report = diagnose_roots(roots, environment=adapter_environment)
+catalog = inspect_components(roots, environment=adapter_environment)
+```
+
+Kida reads that environment without mutating its registries. This keeps adapter
+configuration programmatic and avoids ambient discovery or a Kida config-file
+surface.
+
+Adapters can pass immutable, exact-span `AdviceContext` records to
+`advise_encapsulation_roots(..., context=...)`. Kida recognizes only the
+framework-neutral role, visibility, preservation, response-boundary, and
+consumer-context facts documented in
+[Static Analysis](/docs/advanced/analysis/#adapter-advice-context). Unknown facts
+are ignored, and adapter context never changes parsing, rendering, or default
+diagnostics.
+
+Both functions return a frozen `DiagnosticReport` containing an ordered tuple
+of `Diagnostic` records and a `partial` flag. `partial=True` means requested
+analysis could not finish, such as when malformed source prevents later static
+checks. Reports intentionally have no CLI exit code or stream-routing policy.
+Compiler warnings retain their stable code, template path and line, suggestion,
+and confidence; advisory warnings do not gain a `safe_edit`.
+
+The public model includes `Diagnostic`, `DiagnosticSeverity`,
+`DiagnosticConfidence`, `SourcePosition`, `SourceSpan`, `RelatedLocation`,
+`DiagnosticSnippet`, and `SafeEdit`. Lines are one-based, columns are
+zero-based, and range ends are exclusive. `SafeEdit` requires an exact range;
+the type's presence does not mean every finding has a provably safe edit.
+
+Apply proven edits against the exact source snapshot used for diagnosis:
+
+```python
+from kida.diagnostics import apply_safe_edits
+
+updated = apply_safe_edits(
+    unsaved_editor_text,
+    report.diagnostics,
+    path="pages/account.html",
+)
+```
+
+`apply_safe_edits()` selects edits for the requested path and ignores advisory
+findings and findings for other files. Before changing anything, it verifies
+that every touched source line still matches the diagnostic's captured snippet
+and that selected ranges do not overlap. It raises `ValueError` for stale,
+incomplete, or overlapping edits, leaving the caller's source unchanged.
+
+Kida initially emits safe edits only for `--strict` unified closers: the exact
+`end` keyword in `{% end %}` becomes `endif`, `endfor`, `enddef`, and so on.
+Type typo suggestions, fragile paths, component-call findings, and semantic
+migration advice remain advisory until their complete replacement can be proven.
+
+Framework adapters can normalize caught Kida exceptions without parsing their
+rendered text:
+
+```python
+from kida import TemplateError
+from kida.diagnostics import diagnostic_from_exception
+
+try:
+    template.render(user=user)
+except TemplateError as error:
+    finding = diagnostic_from_exception(error)
+```
+
+`diagnostic_from_exception()` accepts Kida template and lexer exceptions only.
+It raises `TypeError` for unrelated Python exceptions rather than relabeling
+application failures as Kida diagnostics.
+
+A supplied environment also invokes extension diagnostic hooks registered with
+that environment. Extensions receive immutable source/AST context and visible
+component signatures, while Kida validates namespace ownership, category,
+confidence, location, and safe-edit snapshots. See
+[Extensions](/docs/extending/extensions/#static-diagnostics) for the complete
+protocol. Directory diagnosis and the CLI do not discover or run these hooks.
+
+## Render Capture and Manifests
+
+Build and framework tooling can opt in to compiler-injected capture hooks with
+`Environment(enable_capture=True)`, then use `captured_render()` to collect a
+`RenderCapture` for one render. Completed captures can be accumulated in a
+`RenderManifest`, compared as a `ManifestDiff`, inspected through `Fragment`
+records and `FreezeCache`/`FreezeCacheStats`, or adapted into search output with
+`SearchManifestBuilder`, `SearchEntry`, and `default_field_extractor`.
+
+`get_capture()` exposes the active render-local capture to integration helpers.
+The active value is ContextVar-scoped, while captures, manifests, freeze caches,
+and builders remain mutable caller-owned objects. See
+[[docs/advanced/render-capture|Render Capture and Manifests]] for the preferred
+lifecycle, thread-safety rules, runnable workflow, and context-capture privacy
+boundary.
+
 ## Environment
 
 Central configuration and template management hub.
@@ -36,15 +227,21 @@ env = Environment(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `loader` | `Loader` | `None` | Template source provider |
-| `autoescape` | `bool \| Callable` | `True` | HTML auto-escaping |
+| `autoescape` | `bool \| "html" \| "terminal" \| "markdown" \| Callable` | `True` | Output escaping mode |
 | `auto_reload` | `bool` | `True` | Check for source changes |
+| `preserve_ast` | `bool` | `True` | Preserve analysis metadata used by introspection and enriched render capture |
 | `cache_size` | `int` | `400` | Max cached templates |
 | `fragment_cache_size` | `int` | `1000` | Max cached fragments |
 | `fragment_ttl` | `float` | `300.0` | Fragment TTL (seconds) |
 | `static_context` | `dict \| None` | `None` | Values for compile-time partial evaluation |
-| `strict_undefined` | `bool` | `False` | Raise on missing attribute access |
-| `jinja2_compat_warnings` | `bool` | `False` | Warn on `{% set %}` scoping differences |
+| `strict_undefined` | `bool` | `True` | Raise `UndefinedError` on missing variable or attribute access (set to `False` for lenient empty-string fallback) |
+| `jinja2_compat_warnings` | `bool` | `True` | Warn on proven Jinja `if`-local `set` flow that Kida block scope changes |
 | `validate_calls` | `bool` | `False` | Validate `{% def %}` call sites at compile time |
+| `enable_capture` | `bool` | `False` | Compile opt-in render-capture hooks; activate them per render with `captured_render()` |
+
+> **Constructor contract note**: the generated dataclass constructor is part of
+> the snapshot gate. Parameters not documented here are compatibility details
+> rather than recommended framework integration points.
 
 ### Methods
 
@@ -258,6 +455,9 @@ print(card.lineno)            # 3
 print(card.params)            # (DefParamInfo(name='title', annotation='str', ...), ...)
 print(card.slots)             # ('actions', 'footer')
 print(card.has_default_slot)  # True
+print(card.depends_on)        # frozenset({'site.title'})
+print(card.vararg)            # None or '*args' parameter name
+print(card.kwarg)             # None or '**kwargs' parameter name
 ```
 
 **DefMetadata** fields:
@@ -270,6 +470,9 @@ print(card.has_default_slot)  # True
 | `params` | `tuple[DefParamInfo, ...]` | Parameter metadata |
 | `slots` | `tuple[str, ...]` | Named slot names |
 | `has_default_slot` | `bool` | Whether `{% slot %}` (unnamed) exists |
+| `depends_on` | `frozenset[str]` | Context paths read by the def body outside declared params and locals |
+| `vararg` | `str \| None` | Name of `*args` parameter, if present |
+| `kwarg` | `str \| None` | Name of `**kwargs` parameter, if present |
 
 **DefParamInfo** fields:
 
@@ -560,6 +763,12 @@ Classify block metadata into framework roles: `"fragment"`, `"page_root"`, or `N
 
 Base class for all template errors. All Kida exceptions carry an `ErrorCode` accessible via `exc.code`.
 
+The same public `ErrorCode` registry includes static-analysis families for
+privacy (`K-PRI-*`), context contracts (`K-CTX-*`), escaping (`K-ESC-*`),
+accessibility (`K-A11Y-*`), template declaration types (`K-TYP-*`), and fragile
+paths (`K-PATH-001`). Analysis records expose stable string codes so existing
+serialization and comparisons do not need enum-specific handling.
+
 ### TemplateSyntaxError
 
 Invalid template syntax.
@@ -615,12 +824,14 @@ except UndefinedError as e:
     print(e)       # "Undefined variable 'missing' in <string>:1"
 ```
 
-With `strict_undefined=True`, attribute access errors also include component context:
+Under the default strict mode, attribute access errors also include component context:
 
 ```python
-env = Environment(strict_undefined=True)
+env = Environment()  # strict_undefined=True by default
 # "Undefined attribute 'typo' on User object in page.html:5"
 ```
+
+Opt out per-Environment with `strict_undefined=False` if you need empty-string fallback for missing attributes.
 
 ### SecurityError
 
@@ -628,15 +839,51 @@ Raised by `SandboxedEnvironment` when a template violates the security policy. C
 
 ### Warning Classes
 
-Compile-time warnings emitted during template compilation:
+Kida's Python warning categories share one root, so applications can choose a
+specific policy for component-contract findings or one policy for every Kida
+warning:
+
+```text
+UserWarning
+└── KidaWarning
+    ├── ComponentWarning
+    ├── PrecedenceWarning
+    ├── CoercionWarning
+    └── MigrationWarning
+```
 
 | Class | Code | Description |
 |-------|------|-------------|
+| `KidaWarning` | — | Base category for all Python warnings emitted by Kida |
+| `ComponentWarning` | K-CMP-001, K-CMP-002 | Invalid component arguments or statically known prop type mismatches |
 | `PrecedenceWarning` | K-WARN-001 | `\|` binds tighter than `??` |
 | `CoercionWarning` | — | Silent type coercion in filters (e.g. `"abc" \| float` → `0.0`) |
-| `MigrationWarning` | K-WARN-002 | `{% set %}` scoping differs from Jinja2 |
+| `MigrationWarning` | K-WARN-002 | Jinja `if`-local `{% set %}` is read after the Kida block or shadows a template-wide binding |
 
-These are standard Python warnings and can be filtered with `warnings.filterwarnings`.
+Promote only component-contract warnings to errors:
+
+```python
+import warnings
+
+from kida import ComponentWarning
+
+warnings.filterwarnings("error", category=ComponentWarning)
+```
+
+Or apply one policy to every current and future Kida warning category:
+
+```python
+import warnings
+
+from kida import KidaWarning
+
+warnings.filterwarnings("error", category=KidaWarning)
+```
+
+Python warning filters apply to subclasses, so the second example includes
+`ComponentWarning`, `PrecedenceWarning`, `CoercionWarning`, and
+`MigrationWarning`. `TemplateWarning` is different: it is the structured record
+stored in `Template.warnings`, not a subclass of Python's `Warning`.
 
 ---
 

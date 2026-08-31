@@ -208,9 +208,33 @@ class KidaAdapter:
 
 [Chirp](https://github.com/lbliii/chirp) uses this pattern in `KidaAdapter`.
 
+## Framework Error Views
+
+Frameworks should render Kida diagnostics from structured exception data, not by
+scraping `str(exc)` or terminal-oriented `format_compact()` output.
+
+```python
+from kida import TemplateError, UndefinedError
+
+try:
+    html = template.render(context)
+except UndefinedError as exc:
+    diagnostic = exc.to_diagnostic()
+    html = diagnostic.format_html_page()
+except TemplateError as exc:
+    html = f"<pre>{exc.format_compact()}</pre>"
+```
+
+For `UndefinedError`, the diagnostic payload includes the error code, kind,
+missing name, template location, source snippet, ordered hints, documentation
+URL, template stack, and component stack. The built-in HTML and Markdown
+renderers escape source text and names at the final surface. If a framework
+builds its own page, it should keep the Kida template location as authoritative
+and collapse generated Python traceback frames by default.
+
 ## Case Studies
 
-### Bengal (Static Site Generator)
+### Legacy Integration: Bengal (Static Site Generator)
 
 - **Full render** — `render()` for page output
 - **Bytecode cache** — Persistent `.bengal/cache/kida/` for cold-start
@@ -224,6 +248,7 @@ class KidaAdapter:
 - **Layout composition** — `render_with_blocks()` for programmatic layout assembly
 - **Streaming** — `render_stream()`, `render_stream_async()` for chunked HTTP
 - **Introspection** — `template_metadata()` for composition planning, `validate_block_exists()` before `render_block`
+- **Literal block modifiers** — `BlockMetadata.modifiers` for framework-owned enhancement, fallback, and transport declarations
 - **Adapter** — `KidaAdapter` implements Chirp's `TemplateAdapter` interface
 
 **AST-driven OOB discovery**: Chirp uses `template_metadata()` to discover OOB regions
@@ -234,6 +259,11 @@ calls `meta.regions()` (or filters `meta.blocks` by `*_oob` suffix), extracts
 page fragment plus the OOB regions as `hx-swap-oob` updates. See [Chirp's Kida
 Integration](https://lbliii.github.io/chirp/docs/templates/kida-integration/)
 for the full flow.
+
+Kida validates only the generic modifier contract: unique names and literal
+scalar values. Chirp or another framework owns the supported modifier names,
+allowed value vocabulary, and any response behavior derived from them. Reading
+metadata alone does not change Kida rendering or cache identity.
 
 ### Chirp + Regions: Step-by-Step
 

@@ -225,7 +225,13 @@ with LiveRenderer(tpl) as live:
     live.update(status="Complete", progress=100, result=result)
 ```
 
-`LiveRenderer` is thread-safe. Each call to `update()` atomically swaps the render context, so background threads can push updates without locks. The renderer freezes the context snapshot before each render pass to avoid tearing.
+`LiveRenderer` is thread-safe. Each call to `update()` serializes the accumulated
+context merge, terminal-size refresh, render, and output, so background threads
+can push updates without external locks or torn context snapshots. Auto-refresh
+uses that same update path and can run alongside explicit updates. Keep
+context-manager entry/exit and `start_auto()`/`stop_auto()` under one controlling
+thread; those operations own the renderer lifecycle rather than an individual
+render update.
 
 ## Optimize with static_context
 
@@ -393,8 +399,8 @@ Run it with `python dashboard.py` and watch the service statuses, latencies, and
 
 You now have the tools to build rich terminal output with Kida. Here are some directions to explore:
 
-- [[docs/reference/terminal-filters|Terminal Filter Reference]] — full list of terminal filters with examples
-- [[docs/reference/terminal-components|Built-in Components]] — panels, headers, columns, and other layout components
+- [[docs/usage/terminal-rendering|Terminal Rendering]] — terminal filters, layout components, and rendering patterns
+- [[docs/reference/filters|Filter Reference]] — full list of built-in filters
 - The `--explain` flag for inspecting compiled templates and verifying optimizations
 - `examples/terminal_dashboard/` and `examples/terminal_deploy/` in the Kida repository for more patterns
 - [Milo](https://github.com/kida-lang/milo) for building fully interactive terminal applications on top of Kida's rendering layer

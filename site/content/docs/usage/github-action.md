@@ -25,7 +25,7 @@ Render CI reports from structured tool output as GitHub step summaries and PR co
 ## Quick start
 
 ```yaml
-- uses: lbliii/kida@v0.6.0
+- uses: lbliii/kida@v0
   with:
     template: pytest
     data: reports/pytest.xml
@@ -43,6 +43,24 @@ Render CI reports from structured tool output as GitHub step summaries and PR co
 | `jest` | `json` | jest `--json` |
 | `gotest` | `junit-xml` | go-junit-report |
 | `sarif` | `sarif` | CodeQL, Semgrep, Trivy, ESLint |
+| `release-notes` | `github-prs` | GitHub release notes |
+| `release-notes-compact` | `github-prs` | Compact release notes |
+| `release-notes-detailed` | `github-prs` | Detailed release notes |
+| `release-notes-terminal` | `github-prs` | Terminal release notes |
+| `code-review` | `json` | AMP code review |
+| `pr-summary` | `json` | AMP PR summary |
+| `deploy-preview` | `json` | AMP deploy preview |
+| `dependency-review` | `json` | AMP dependency review |
+| `security-scan` | `json` | AMP security scan |
+| `copilot-instructions` | `json` | Agent instructions |
+
+## Report contracts
+
+Built-in report templates are fixture-backed and snapshot-tested. AMP templates (`code-review`, `pr-summary`, `deploy-preview`, `dependency-review`, `security-scan`, and `release-notes`) are also checked against their `schemas/amp/v1/` JSON schemas.
+
+Markdown output escapes untrusted tool and agent text before it reaches tables, details blocks, headings, links, or code snippets. Reports are designed to render in both GitHub step summaries and PR comments.
+
+PR comments are updated by a stable HTML marker derived from `comment-header`. Use the same `comment-header` with `comment-mode: append` when multiple report steps should share one comment.
 
 ## Inputs
 
@@ -50,14 +68,16 @@ Render CI reports from structured tool output as GitHub step summaries and PR co
 | --- | --- | --- | --- |
 | `template` | yes | — | Built-in name or path to custom `.md` template |
 | `data` | yes | — | Path to the data file |
-| `data-format` | no | `json` | `json`, `junit-xml`, `sarif`, `lcov` |
-| `post-to` | no | `step-summary` | `step-summary`, `pr-comment`, or both (comma-separated) |
+| `data-format` | no | `json` | `json`, `junit-xml`, `sarif`, `lcov`, `github-prs` |
+| `post-to` | no | `step-summary` | `step-summary`, `pr-comment`, `release`, `release-asset`, `slack`, `changelog` (comma-separated) |
 | `comment-header` | no | template name | Identifies the PR comment for updates |
 | `comment-mode` | no | `replace` | `replace` overwrites; `append` adds below existing content |
 | `fail-under` | no | — | Fail the step if coverage/pass-rate is below this % |
 | `context` | no | — | JSON string with extra template variables |
 | `token` | no | `github.token` | Token for PR comments |
-| `python-version` | no | `3.12` | Python version (`3.12+`), or `skip` to use your own |
+| `app-id` | no | — | GitHub App ID for branded PR comments |
+| `app-private-key` | no | — | GitHub App private key for branded PR comments |
+| `python-version` | no | `3.14` | Python version (`3.14+`), or `skip` to use your own |
 | `install` | no | `true` | Set `false` if kida is already installed |
 | `kida-command` | no | `kida` | Override command (e.g. `uv run kida`) |
 
@@ -67,6 +87,7 @@ Render CI reports from structured tool output as GitHub step summaries and PR co
 | --- | --- |
 | `report` | Rendered markdown content |
 | `comment-id` | PR comment ID (when posting to PR) |
+| `data-file` | Collected JSON path when `data-format: github-prs` |
 
 ## Examples
 
@@ -80,7 +101,7 @@ Render CI reports from structured tool output as GitHub step summaries and PR co
 
 - name: Test report
   if: always()
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: pytest
     data: reports/pytest.xml
@@ -89,7 +110,7 @@ Render CI reports from structured tool output as GitHub step summaries and PR co
 
 - name: Coverage report
   if: always()
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: coverage
     data: reports/coverage.json
@@ -103,7 +124,7 @@ Use the same `comment-header` with `comment-mode: append` to build a single PR c
 
 ```yaml
 - name: Test report
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: pytest
     data: reports/pytest.xml
@@ -112,7 +133,7 @@ Use the same `comment-header` with `comment-mode: append` to build a single PR c
     comment-header: CI Report
 
 - name: Coverage report
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: coverage
     data: reports/coverage.json
@@ -121,7 +142,7 @@ Use the same `comment-header` with `comment-mode: append` to build a single PR c
     comment-mode: append
 
 - name: Lint report
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: ruff
     data: reports/ruff.json
@@ -147,7 +168,7 @@ Pass changed file paths via `context` to highlight coverage for PR-touched files
     GH_TOKEN: ${{ github.token }}
 
 - name: Coverage report
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: coverage
     data: reports/coverage.json
@@ -163,7 +184,7 @@ Pass changed file paths via `context` to highlight coverage for PR-touched files
 
 - name: Lint report
   if: always()
-  uses: lbliii/kida@v0.6.0
+  uses: lbliii/kida@v0
   with:
     template: ruff
     data: reports/ruff.json
@@ -175,7 +196,7 @@ Pass changed file paths via `context` to highlight coverage for PR-touched files
 Point `template` at any `.md` file in your repo. Data is unpacked as template variables:
 
 ```yaml
-- uses: lbliii/kida@v0.6.0
+- uses: lbliii/kida@v0
   with:
     template: .github/templates/my-report.md
     data: results.json
@@ -184,7 +205,7 @@ Point `template` at any `.md` file in your repo. Data is unpacked as template va
 ### Skip Python setup (pre-installed)
 
 ```yaml
-- uses: lbliii/kida@v0.6.0
+- uses: lbliii/kida@v0
   with:
     template: pytest
     data: results.xml
@@ -193,6 +214,52 @@ Point `template` at any `.md` file in your repo. Data is unpacked as template va
     install: 'false'
     kida-command: uv run kida
 ```
+
+### Release notes from merged pull requests
+
+Use a full-history checkout so tag discovery, comparison dates, direct commits,
+and diff statistics are available:
+
+```yaml
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0
+
+- uses: lbliii/kida@v0
+  id: release-notes
+  with:
+    template: release-notes
+    data: auto
+    data-format: github-prs
+    head-ref: v0.12.0
+    post-to: step-summary
+```
+
+The collector follows every page of merged pull requests, validates GitHub's
+response and the report data contract, and fails with an explicit Action error
+for malformed responses, missing refs, or a base ref that is not an ancestor of
+the head. Network access is limited to the collector boundary; report rendering
+uses the resulting JSON file.
+
+To reproduce collection locally from a full clone with authenticated `gh`:
+
+```bash
+GH_TOKEN="$(gh auth token)" \
+python action_support/release_notes.py \
+  --repository owner/repo \
+  --base-ref v0.11.0 \
+  --head-ref v0.12.0 \
+  --repository-root . \
+  --output /tmp/kida-release-data.json
+
+uv run kida render templates/release-notes-report.md \
+  --data /tmp/kida-release-data.json \
+  --data-format json
+```
+
+Release-created workflow events preserve curated GitHub release bodies and post
+the generated report only to the step summary. The manual release-notes workflow
+may publish generated notes when explicitly invoked.
 
 ## Agent templates (AMP)
 

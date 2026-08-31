@@ -32,7 +32,7 @@ composition.
 |---------|--------|---------|
 | Output | `{{ expr }}` | `{{ user.name }}` |
 | Tags | `{% tag %}` | `{% if %}`, `{% for %}` |
-| Block end | `{% end %}` | Unified ending |
+| Canonical block end | `{% end %}` | Matching explicit closers are also accepted |
 | Comments | `{# text #}` | `{# TODO #}` |
 | Filters | `\| filter` | `{{ name \| upper }}` |
 | Pipeline | `\|> filter` | `{{ x \|> a \|> b }}` |
@@ -47,7 +47,7 @@ composition.
 :gap: medium
 
 :::{card} Variables
-:icon: variable
+:icon: code
 :link: /docs/syntax/variables/
 :description: Output expressions and access patterns
 `{{ name }}`, `{{ user.email }}`, `{{ items[0] }}`
@@ -71,7 +71,7 @@ composition.
 :icon: function
 :link: /docs/syntax/functions/
 :description: Define reusable template functions and regions
-`{% def %}`, `{% region %}`, `{% yield %}`, `{% macro %}`
+`{% def %}`, `{% region %}`, `{% yield %}`, `{% call %}`
 :::{/card}
 
 :::{card} Inheritance
@@ -82,7 +82,7 @@ composition.
 :::{/card}
 
 :::{card} Includes
-:icon: file-plus
+:icon: file
 :link: /docs/syntax/includes/
 :description: Include partials and components
 `{% include %}`, context passing
@@ -96,7 +96,7 @@ composition.
 :::{/card}
 
 :::{card} Async
-:icon: refresh-cw
+:icon: arrow-clockwise
 :link: /docs/syntax/async/
 :description: Async iteration and await
 `async for`, `await`, async templates
@@ -106,7 +106,8 @@ composition.
 
 ## Key Features
 
-- **Unified `{% end %}`** — Clean, consistent block endings
+- **Canonical unified `{% end %}`** — Clean, consistent block endings; matching
+  explicit closers remain valid
 - **Pattern matching** — `{% match status %}{% case "active" %}...{% end %}`
 - **Pipeline operator** — `{{ title |> escape |> upper |> truncate(50) }}`
 - **Safe pipeline** — `{{ user?.name ?|> upper ?? "Anonymous" }}` — None-propagating
